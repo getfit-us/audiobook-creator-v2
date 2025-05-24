@@ -84,8 +84,8 @@ def get_active_tasks():
             timestamp = datetime.fromisoformat(task_info["timestamp"])
             hours_old = (current_time - timestamp).total_seconds() / 3600
 
-            # Automatically remove very old tasks (older than 6 hours)
-            if hours_old > 6:
+            # Automatically remove very old tasks (older than 48 hours)
+            if hours_old > 48:
                 tasks_to_clean.append(task_id)
                 continue
 
@@ -609,23 +609,17 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     "🧹 Clear Old Tasks", variant="secondary", size="sm"
                 )
 
-            gr.Markdown(
-                "*Clear Old Tasks removes completed, failed, and very old generation tasks from the tracking system.*",
-                elem_classes=["text-sm", "text-muted"],
-            )
-
             past_files_display = gr.Markdown(
                 value="Click refresh to see generated audiobooks.", visible=True
             )
 
-            past_files_dropdown = gr.Dropdown(
-                label="Select a past audiobook",
-                choices=[],
-                visible=False,
-                interactive=True,
-            )
-
             with gr.Row():
+                past_files_dropdown = gr.Dropdown(
+                    label="Select a past audiobook",
+                    choices=[],
+                    visible=False,
+                    interactive=True,
+                )
                 past_file_download = gr.File(
                     label="Download Selected Audiobook",
                     interactive=False,
@@ -633,12 +627,12 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     visible=False,
                 )
 
-                delete_btn = gr.Button(
-                    "🗑️ Delete Selected",
-                    variant="stop",
-                    size="sm",
-                    visible=False,
-                )
+            delete_btn = gr.Button(
+                "🗑️ Delete Selected",
+                variant="stop",
+                size="sm",
+                visible=False,
+            )
 
             # Confirmation dialog for deletion (hidden by default)
             with gr.Group(visible=False) as delete_confirmation:

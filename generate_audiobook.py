@@ -370,44 +370,6 @@ async def generate_audio_with_single_voice(
                     with open(parts_list_file, "r") as f:
                         print(f.read())
 
-                    # Use FFmpeg filter_complex concat for more reliable concatenation
-                    input_args = ""
-                    filter_complex = ""
-
-                    for i, part_file in enumerate(part_files):
-                        input_args += f" -i '{part_file}'"
-
-                    # Build concat filter - more reliable than demuxer
-                    filter_inputs = "".join(
-                        [f"[{i}:a]" for i in range(len(part_files))]
-                    )
-                    filter_complex = (
-                        f"{filter_inputs}concat=n={len(part_files)}:v=0:a=1[outa]"
-                    )
-
-                    ffmpeg_cmd = f'ffmpeg -y{input_args} -filter_complex "{filter_complex}" -map "[outa]" -c:a aac -b:a 256k \'{final_line_path}\''
-
-                    # Debug: Print info about the parts before concatenation
-                    # print(
-                    #     f"\n=== DEBUG: Line {line_index} has {len(part_files)} parts ==="
-                    # )
-                    # print(f"Line text: '{line[:100]}...'")
-                    for i, part_file in enumerate(part_files):
-
-                        # Check if file exists and get size
-                        if os.path.exists(part_file):
-                            file_size = os.path.getsize(part_file)
-                            print(f"  File size: {file_size} bytes")
-                        else:
-                            print(f"  ERROR: File does not exist!")
-
-                    # print(f"FFmpeg command: {ffmpeg_cmd}")
-                    # print(
-                    #     f"Proceeding with concatenation of {len(part_files)} parts..."
-                    # )
-
-                    # # Step 1: Normalize all parts to ensure compatibility
-                    # print(f"Normalizing {len(part_files)} parts for concatenation...")
                     normalized_parts = []
 
                     for i, part_file in enumerate(part_files):
@@ -605,36 +567,45 @@ async def generate_audio_with_single_voice(
     for chapter_file in chapter_files:
         # Force m4a extension for chapter files with Orpheus to avoid issues
         if MODEL == "orpheus":
-            chapter_path = os.path.join(
-                f"{TEMP_DIR}/{book_title}", f"{chapter_file.split('.')[0]}.m4a"
-            )
+            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
         else:
-            chapter_path = os.path.join(f"{TEMP_DIR}/{book_title}", chapter_file)
+            chapter_path = chapter_file
+        # Debugging
+        print(f"Chapter file: {chapter_file}")
+        print(f"Chapter path: {chapter_path}")
 
         # Create a temporary file list for this chapter's lines
         chapter_lines_list = os.path.join(
             f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
         )
+        # Debugging
+        print(f"Chapter lines list: {chapter_lines_list}")
+        # Delete the chapter_lines_list file if it exists
+        if os.path.exists(chapter_lines_list):
+            os.remove(chapter_lines_list)
+
         with open(chapter_lines_list, "w", encoding="utf-8") as f:
             for line_index in sorted(chapter_line_map[chapter_file]):
                 line_audio_path = os.path.join(
                     temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
-                f.write(f"file '{line_audio_path}'\n")
+                # Use absolute path to prevent path duplication issues
+                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
+                # Debugging
+                print(f"Added line {line_index} to chapter {chapter_file}")
+                print(f"Line audio path: {line_audio_path}")
+                print(f"Chapter path: {chapter_path}")
 
         # Use FFmpeg to concatenate the lines
         if MODEL == "orpheus":
             # For Orpheus, convert WAV segments to M4A chapters directly
             ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
+                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
             )
         else:
-            # For other models, we need to re-encode to ensure proper AAC format
-            ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
-            )
+            # For other models, we can use copy
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
 
         # Print the command for debugging
         print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
@@ -694,14 +665,14 @@ async def generate_audio_with_single_voice(
     if generate_m4b_audiobook_file:
         # Merge all chapter files into a final m4b audiobook
         yield "Creating M4B audiobook file..."
-        merge_chapters_to_m4b(book_path, m4a_chapter_files)
+        merge_chapters_to_m4b(book_path, m4a_chapter_files, book_title)
         # clean the temp directory
         shutil.rmtree(f"{TEMP_DIR}/{book_title}")
         yield "M4B audiobook created successfully"
     else:
         # Merge all chapter files into a standard M4A audiobook
         yield "Creating final audiobook..."
-        merge_chapters_to_standard_audio_file(m4a_chapter_files)
+        merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
         safe_book_title = sanitize_book_title_for_filename(book_title)
         convert_audio_file_formats(
             API_OUTPUT_FORMAT, output_format, "generated_audiobooks", safe_book_title
@@ -1109,29 +1080,37 @@ async def generate_audio_with_multiple_voices(
     for chapter_file in chapter_files:
         # Force m4a extension for chapter files with Orpheus to avoid issues
         if MODEL == "orpheus":
-            chapter_path = os.path.join(TEMP_DIR, f"{chapter_file.split('.')[0]}.m4a")
+            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
         else:
-            chapter_path = os.path.join(TEMP_DIR, chapter_file)
+            chapter_path = chapter_file
+        # Debugging
+        print(f"Chapter file: {chapter_file}")
+        print(f"Chapter path: {chapter_path}")
 
         # Create a temporary file list for this chapter's lines
-        chapter_lines_list = "chapter_lines_list.txt"
+        chapter_lines_list = f"{TEMP_DIR}/{book_title}/chapter_lines_list.txt"
         with open(chapter_lines_list, "w", encoding="utf-8") as f:
             for line_index in sorted(chapter_line_map[chapter_file]):
                 line_audio_path = os.path.join(
                     temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
-                f.write(f"file '{line_audio_path}'\n")
+                # Use absolute path to prevent path duplication issues
+                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
+                # Debugging
+                print(f"Added line {line_index} to chapter {chapter_file}")
+                print(f"Line audio path: {line_audio_path}")
+                print(f"Chapter path: {chapter_path}")
 
         # Use FFmpeg to concatenate the lines
         if MODEL == "orpheus":
             # For Orpheus, convert WAV segments to M4A chapters directly
             ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
+                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
             )
         else:
             # For other models, we can use copy
-            ffmpeg_cmd = f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} -c copy '{chapter_path}'"
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
 
         # Print the command for debugging
         print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
@@ -1190,12 +1169,12 @@ async def generate_audio_with_multiple_voices(
     if generate_m4b_audiobook_file:
         # Merge all chapter files into a final m4b audiobook
         yield "Creating M4B audiobook file..."
-        merge_chapters_to_m4b(book_path, m4a_chapter_files)
+        merge_chapters_to_m4b(book_path, m4a_chapter_files, book_title)
         yield "M4B audiobook created successfully"
     else:
         # Merge all chapter files into a standard M4A audiobook
         yield "Creating final audiobook..."
-        merge_chapters_to_standard_audio_file(m4a_chapter_files)
+        merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
         safe_book_title = sanitize_book_title_for_filename(book_title)
         convert_audio_file_formats(
             "m4a", output_format, "generated_audiobooks", safe_book_title
@@ -1256,7 +1235,7 @@ async def process_audiobook_generation(
     yield f"\n🎧 Audiobook is generated ! You can now download it in the Download section below. Click on the blue download link next to the file name."
 
 
-async def main(book_title: str):
+async def main(book_title="audiobook"):
     os.makedirs(f"{TEMP_DIR}/{book_title}/generated_audiobooks", exist_ok=True)
 
     # Default values
@@ -1389,7 +1368,8 @@ async def test_single_voice():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run(main())
     ## create book txt file
 
-    # asyncio.run(test_single_voice())
+    ## create m4b file
+    asyncio.run(test_single_voice())

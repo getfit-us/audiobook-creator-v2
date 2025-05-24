@@ -24,12 +24,21 @@ from config.constants import TEMP_DIR
 from utils.run_shell_commands import run_shell_command
 
 
-def create_default_cover_image():
+def create_default_cover_image(cover_path="cover.jpg"):
     """
     Creates a simple default cover image using FFmpeg if cover.jpg doesn't exist.
+
+    Args:
+        cover_path (str): The path where the cover image should be created.
     """
-    if not os.path.exists("cover.jpg"):
+    if not os.path.exists(cover_path):
         try:
+            # Ensure the directory exists
+            os.makedirs(
+                os.path.dirname(cover_path) if os.path.dirname(cover_path) else ".",
+                exist_ok=True,
+            )
+
             # Create a simple black cover image with text using FFmpeg
             cmd = [
                 "ffmpeg",
@@ -42,13 +51,13 @@ def create_default_cover_image():
                 "drawtext=text='Audiobook':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=48:fontcolor=white",
                 "-frames:v",
                 "1",
-                "cover.jpg",
+                cover_path,
             ]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode == 0:
-                print("Created default cover image: cover.jpg")
+                print(f"Created default cover image: {cover_path}")
             else:
-                print("Warning: Could not create default cover image")
+                print(f"Warning: Could not create default cover image at {cover_path}")
         except Exception as e:
             print(f"Warning: Could not create default cover image: {e}")
 
@@ -60,7 +69,7 @@ def escape_metadata(value):
     return ""
 
 
-def get_ebook_metadata_with_cover(book_path):
+def get_ebook_metadata_with_cover(book_path, book_title="audiobook"):
     """
     Extracts metadata from an ebook and saves its cover image.
 
@@ -71,16 +80,37 @@ def get_ebook_metadata_with_cover(book_path):
         dict: A dictionary containing the ebook's metadata.
     """
     try:
+        # First try to find ebook-meta in PATH
         ebook_meta_bin_result = run_shell_command("which ebook-meta")
 
-        # Check if ebook-meta was found
-        if ebook_meta_bin_result is None or not ebook_meta_bin_result.stdout.strip():
+        ebook_meta_bin_path = None
+
+        # Check if ebook-meta was found in PATH
+        if ebook_meta_bin_result and ebook_meta_bin_result.stdout.strip():
+            ebook_meta_bin_path = ebook_meta_bin_result.stdout.strip()
+        else:
+            # Try common installation paths for Calibre
+            common_paths = [
+                "/Applications/calibre.app/Contents/MacOS/ebook-meta",  # macOS App Store/DMG install
+                "/usr/local/bin/ebook-meta",  # Homebrew install
+                "/opt/homebrew/bin/ebook-meta",  # Homebrew Apple Silicon
+                "/usr/bin/ebook-meta",  # System install
+            ]
+
+            for path in common_paths:
+                if os.path.exists(path):
+                    ebook_meta_bin_path = path
+                    break
+
+        if not ebook_meta_bin_path:
             print("Warning: ebook-meta not found. Using default metadata for M4B file.")
+
             # Create a simple default cover image if it doesn't exist
-            create_default_cover_image()
+            cover_path = f"{TEMP_DIR}/{book_title}/cover.jpg"
+            create_default_cover_image(cover_path)
             # Return default metadata when ebook-meta is not available
             return {
-                "Title": "Audiobook",
+                "Title": book_title,
                 "Author(s)": "Unknown",
                 "Publisher": "Unknown",
                 "Languages": "en",
@@ -88,10 +118,8 @@ def get_ebook_metadata_with_cover(book_path):
                 "Comments": "Generated audiobook",
             }
 
-        ebook_meta_bin_path = ebook_meta_bin_result.stdout.strip()
-
         # Command to extract metadata and cover image using ebook-meta
-        command = f"{ebook_meta_bin_path} '{book_path}' --get-cover cover.jpg"
+        command = f"'{ebook_meta_bin_path}' '{book_path}' --get-cover '{TEMP_DIR}/{book_title}/cover.jpg'"
 
         # Run the command and capture the result
         result = run_shell_command(command)
@@ -101,7 +129,8 @@ def get_ebook_metadata_with_cover(book_path):
                 "Warning: Failed to extract metadata. Using default metadata for M4B file."
             )
             # Create a simple default cover image if extraction failed
-            create_default_cover_image()
+            cover_path = f"{TEMP_DIR}/{book_title}/cover.jpg"
+            create_default_cover_image(cover_path)
             return {
                 "Title": "Audiobook",
                 "Author(s)": "Unknown",
@@ -118,6 +147,14 @@ def get_ebook_metadata_with_cover(book_path):
                 key, value = line.split(": ", 1)
                 metadata[key.strip()] = value.strip()
 
+        # Check if cover was actually extracted
+        cover_path = f"{TEMP_DIR}/{book_title}/cover.jpg"
+        if os.path.exists(cover_path):
+            print(f"✅ Cover image extracted from epub: {cover_path}")
+        else:
+            print(f"Warning: Cover image was not extracted, creating default...")
+            create_default_cover_image(cover_path)
+
         return metadata
 
     except Exception as e:
@@ -125,7 +162,8 @@ def get_ebook_metadata_with_cover(book_path):
             f"Warning: Error extracting metadata: {e}. Using default metadata for M4B file."
         )
         # Create a simple default cover image if there was an exception
-        create_default_cover_image()
+        cover_path = f"{TEMP_DIR}/{book_title}/cover.jpg"
+        create_default_cover_image(cover_path)
         # Return default metadata when there's an error
         return {
             "Title": "Audiobook",
@@ -160,8 +198,34 @@ def get_audio_duration_using_ffprobe(file_path):
     ]
     # Run the command and capture the output
     result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Check if ffprobe command was successful
+    if result.returncode != 0:
+        print(f"ERROR: ffprobe failed for file: {file_path}")
+        print(f"ERROR: Command: {' '.join(cmd)}")
+        print(f"ERROR: Return code: {result.returncode}")
+        print(f"ERROR: Stdout: {result.stdout}")
+        print(f"ERROR: Stderr: {result.stderr}")
+        raise RuntimeError(f"ffprobe failed to get duration for {file_path}")
+
+    # Check if stdout is empty
+    if not result.stdout.strip():
+        print(f"ERROR: ffprobe returned empty output for file: {file_path}")
+        print(f"ERROR: Command: {' '.join(cmd)}")
+        print(f"ERROR: File exists: {os.path.exists(file_path)}")
+        if os.path.exists(file_path):
+            print(f"ERROR: File size: {os.path.getsize(file_path)} bytes")
+        raise ValueError(f"ffprobe returned empty duration for {file_path}")
+
     # Convert the output to an integer (in milliseconds) and return it
-    return int(float(result.stdout.strip()) * 1000)
+    try:
+        return int(float(result.stdout.strip()) * 1000)
+    except ValueError as e:
+        print(
+            f"ERROR: Could not convert ffprobe output to float: '{result.stdout.strip()}'"
+        )
+        print(f"ERROR: File: {file_path}")
+        raise e
 
 
 def get_audio_duration_using_raw_ffmpeg(file_path):
@@ -188,7 +252,9 @@ def get_audio_duration_using_raw_ffmpeg(file_path):
         return None
 
 
-def generate_chapters_file(chapter_files, output_file="chapters.txt"):
+def generate_chapters_file(
+    chapter_files, book_title="audiobook", output_file="chapters.txt"
+):
     """
     Generates a chapter metadata file for FFmpeg.
 
@@ -196,13 +262,16 @@ def generate_chapters_file(chapter_files, output_file="chapters.txt"):
 
     Args:
         chapter_files (list): A list of the paths to the individual chapter audio files.
+        book_title (str): The title/name of the book for directory structure.
         output_file (str): The path to the output chapter metadata file. Defaults to "chapters.txt".
     """
     start_time = 0
     with open(f"{TEMP_DIR}/{output_file}", "w", encoding="utf-8") as f:
         f.write(";FFMETADATA1\n")
         for chapter in chapter_files:
-            duration = get_audio_duration_using_ffprobe(os.path.join(TEMP_DIR, chapter))
+            duration = get_audio_duration_using_ffprobe(
+                os.path.join(TEMP_DIR, book_title, chapter)
+            )
             end_time = start_time + duration
 
             # Write the chapter metadata to the file
@@ -385,7 +454,7 @@ def convert_audio_file_formats(input_format, output_format, folder_path, file_na
         create_pcm_file_from_m4a_file(input_path, output_path)
 
 
-def merge_chapters_to_m4b(book_path, chapter_files):
+def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
     """
     Uses ffmpeg to merge all chapter files into an M4B audiobook.
 
@@ -394,14 +463,15 @@ def merge_chapters_to_m4b(book_path, chapter_files):
     Args:
         book_path (str): The path to the book file.
         chapter_files (list): A list of the paths to the individual chapter audio files.
+        book_title (str): The title/name of the book for directory structure.
     """
     file_list_path = "chapter_list.txt"
 
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
-            f.write(f"file '{os.path.join(TEMP_DIR, chapter)}'\n")
+            f.write(f"file '{os.path.join(TEMP_DIR, book_title, chapter)}'\n")
 
-    metadata = get_ebook_metadata_with_cover(book_path)
+    metadata = get_ebook_metadata_with_cover(book_path, book_title)
     title = escape_metadata(metadata.get("Title", ""))
     authors = escape_metadata(metadata.get("Author(s)", ""))
     publisher = escape_metadata(metadata.get("Publisher", ""))
@@ -410,10 +480,18 @@ def merge_chapters_to_m4b(book_path, chapter_files):
     comments = escape_metadata(metadata.get("Comments", ""))
 
     # Generate chapter metadata
-    generate_chapters_file(chapter_files, "chapters.txt")
+    generate_chapters_file(chapter_files, book_title, "chapters.txt")
 
-    output_m4b = f"generated_audiobooks/{title}.m4b"
-    cover_image = "cover.jpg"
+    # Use sanitized book title for filename to avoid issues with spaces
+    safe_book_title = "".join(
+        c for c in book_title if c.isalnum() or c in (" ", "-", "_")
+    ).rstrip()
+    safe_book_title = (
+        safe_book_title.replace(" ", "_") or "audiobook"
+    )  # Replace spaces with underscores
+
+    output_m4b = f"generated_audiobooks/{safe_book_title}.m4b"
+    cover_image = f"{TEMP_DIR}/{book_title}/cover.jpg"
 
     # Construct metadata arguments safely
     metadata = (
@@ -428,7 +506,7 @@ def merge_chapters_to_m4b(book_path, chapter_files):
     )
 
     ffmpeg_cmd = (
-        f"ffmpeg -y -f concat -safe 0 -i {file_list_path} -i {cover_image} -i chapters.txt "
+        f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i chapters.txt '
         f'-c copy -map 0 -map 1 -disposition:v:0 attached_pic -map_metadata 2 {metadata} "{output_m4b}"'
     )
 
@@ -441,10 +519,9 @@ def add_silence_to_audio_file_by_appending_pre_generated_silence(
 ):
     silence_path = "static_files/silence.aac"
 
-    
     with open(silence_path, "rb") as silence_file, open(
-            f"{temp_dir}/{input_file_name}", "ab"
-        ) as audio_file:
+        f"{temp_dir}/{input_file_name}", "ab"
+    ) as audio_file:
         audio_file.write(silence_file.read())
 
 
@@ -474,7 +551,7 @@ def add_silence_to_audio_file_by_reencoding_using_ffmpeg(
     subprocess.run(rename_file_command, shell=True, check=True)
 
 
-def merge_chapters_to_standard_audio_file(chapter_files):
+def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook"):
     """
     Uses ffmpeg to merge all chapter files into a standard M4A audio file).
 
@@ -482,16 +559,25 @@ def merge_chapters_to_standard_audio_file(chapter_files):
 
     Args:
         chapter_files (list): A list of the paths to the individual chapter audio files.
+        book_title (str): The title/name of the book for directory structure.
     """
     file_list_path = "chapter_list.txt"
 
     # Write the list of chapter files to a text file (ffmpeg input)
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
-            f.write(f"file '{os.path.join(TEMP_DIR, chapter)}'\n")
+            f.write(f"file '{os.path.join(TEMP_DIR, book_title, chapter)}'\n")
+
+    # Use sanitized book title for filename to avoid issues with spaces
+    safe_book_title = "".join(
+        c for c in book_title if c.isalnum() or c in (" ", "-", "_")
+    ).rstrip()
+    safe_book_title = (
+        safe_book_title.replace(" ", "_") or "audiobook"
+    )  # Replace spaces with underscores
 
     # Construct the output file path
-    output_file = f"generated_audiobooks/audiobook.m4a"
+    output_file = f"generated_audiobooks/{safe_book_title}.m4a"
 
     # Construct the ffmpeg command
     ffmpeg_cmd = (
