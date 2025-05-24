@@ -127,6 +127,84 @@ def check_if_chapter_heading(text):
     return False  # No match
 
 
+def concatenate_chapters(
+    chapter_files, book_title, chapter_line_map, temp_line_audio_dir
+):
+    """
+    Concatenates the chapters into a single audiobook file.
+    """
+    # Third pass: Concatenate audio files for each chapter in order
+    chapter_assembly_bar = tqdm(
+        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    )
+
+    for chapter_file in chapter_files:
+        # Force m4a extension for chapter files with Orpheus to avoid issues
+        if MODEL == "orpheus":
+            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
+        else:
+            chapter_path = chapter_file
+        # Debugging
+        print(f"Chapter file: {chapter_file}")
+        print(f"Chapter path: {chapter_path}")
+
+        # Create a temporary file list for this chapter's lines
+        chapter_lines_list = os.path.join(
+            f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
+        )
+        # Debugging
+        print(f"Chapter lines list: {chapter_lines_list}")
+        # Delete the chapter_lines_list file if it exists
+        if os.path.exists(chapter_lines_list):
+            os.remove(chapter_lines_list)
+
+        with open(chapter_lines_list, "w", encoding="utf-8") as f:
+            for line_index in sorted(chapter_line_map[chapter_file]):
+                line_audio_path = os.path.join(
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
+                )
+                # Use absolute path to prevent path duplication issues
+                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
+                # Debugging
+                print(f"Added line {line_index} to chapter {chapter_file}")
+                print(f"Line audio path: {line_audio_path}")
+                print(f"Chapter path: {chapter_path}")
+
+        # Use FFmpeg to concatenate the lines
+        if MODEL == "orpheus":
+            # For Orpheus, convert WAV segments to M4A chapters directly
+            ffmpeg_cmd = (
+                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
+            )
+        else:
+            # For other models, we can use copy
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
+
+        # Print the command for debugging
+        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
+        try:
+            result = subprocess.run(
+                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
+            )
+            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
+            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
+            print(f"[ERROR] Command: {ffmpeg_cmd}")
+            print(f"[ERROR] Stdout: {e.stdout}")
+            print(f"[ERROR] Stderr: {e.stderr}")
+            raise e
+
+        chapter_assembly_bar.update(1)
+        yield f"Assembled chapter: {chapter_file}"
+
+        # Clean up the temporary file list
+        os.remove(chapter_lines_list)
+
+    chapter_assembly_bar.close()
+
+
 def find_voice_for_gender_score(character: str, character_gender_map, voice_map):
     """
     Finds the appropriate voice for a character based on their gender score.
@@ -144,15 +222,70 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
         str: The voice identifier that matches the character's gender score.
     """
 
-    # Get the character's gender score
-    character_gender_score_doc = character_gender_map["scores"][character.lower()]
-    character_gender_score = character_gender_score_doc["gender_score"]
+    try:
+        # Get the character's gender score
+        character_lower = character.lower()
 
-    # Iterate over the voice identifiers and their scores
-    for voice, score in voice_map.items():
-        # Find the voice identifier that matches the character's gender score
-        if score == character_gender_score:
-            return voice
+        # Check if character exists in the character_gender_map
+        if character_lower not in character_gender_map["scores"]:
+            print(
+                f"WARNING: Character '{character}' not found in character_gender_map. Using narrator voice as fallback."
+            )
+            # Use narrator's voice as fallback
+            if "narrator" in character_gender_map["scores"]:
+                character_gender_score_doc = character_gender_map["scores"]["narrator"]
+                character_gender_score = character_gender_score_doc["gender_score"]
+            else:
+                print(
+                    f"ERROR: Even narrator not found in character_gender_map. Using score 5 (neutral)."
+                )
+                character_gender_score = 5
+        else:
+            character_gender_score_doc = character_gender_map["scores"][character_lower]
+            character_gender_score = character_gender_score_doc["gender_score"]
+
+        # Iterate over the voice identifiers and their scores
+        for voice, score in voice_map.items():
+            # Find the voice identifier that matches the character's gender score
+            if score == character_gender_score:
+                return voice
+
+        # If no exact match found, find the closest gender score
+        print(
+            f"WARNING: No exact voice match for character '{character}' with gender score {character_gender_score}. Finding closest match."
+        )
+
+        closest_voice = None
+        closest_diff = float("inf")
+
+        for voice, score in voice_map.items():
+            diff = abs(score - character_gender_score)
+            if diff < closest_diff:
+                closest_diff = diff
+                closest_voice = voice
+
+        if closest_voice:
+            print(
+                f"Using voice '{closest_voice}' (score {voice_map[closest_voice]}) for character '{character}' (score {character_gender_score})"
+            )
+            return closest_voice
+
+        # Final fallback: use the first available voice
+        if voice_map:
+            fallback_voice = list(voice_map.keys())[0]
+            print(
+                f"ERROR: Could not find suitable voice for character '{character}'. Using fallback voice '{fallback_voice}'."
+            )
+            return fallback_voice
+
+        # Absolute fallback for empty voice_map
+        print(f"CRITICAL ERROR: voice_map is empty. Using hardcoded fallback voice.")
+        return "af_heart"  # Default fallback voice
+
+    except Exception as e:
+        print(f"ERROR in find_voice_for_gender_score for character '{character}': {e}")
+        print("Using hardcoded fallback voice.")
+        return "af_heart"  # Default fallback voice
 
 
 def preprocess_text_for_orpheus(text):
@@ -265,7 +398,10 @@ async def generate_audio_with_single_voice(
     # Initial setup for chapters
     chapter_index = 1
 
-    current_chapter_audio = f"Introduction.{output_format}"
+    if MODEL == "orpheus":
+        current_chapter_audio = "Introduction.m4a"
+    else:
+        current_chapter_audio = f"Introduction.{output_format}"
     chapter_files = []
 
     # First pass: Generate audio for each line independently
@@ -544,9 +680,13 @@ async def generate_audio_with_single_voice(
         # Check if this is a chapter heading
         if result["is_chapter_heading"]:
             chapter_index += 1
-            current_chapter_audio = (
-                f"{sanitize_filename(result['line'])}.{output_format}"
-            )
+
+            if MODEL == "orpheus":
+                current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
+            else:
+                current_chapter_audio = (
+                    f"{sanitize_filename(result['line'])}.{output_format}"
+                )
 
         if current_chapter_audio not in chapter_files:
             chapter_files.append(current_chapter_audio)
@@ -559,76 +699,9 @@ async def generate_audio_with_single_voice(
     chapter_organization_bar.close()
     yield "Organizing audio by chapters complete"
 
-    # Third pass: Concatenate audio files for each chapter in order
-    chapter_assembly_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    concatenate_chapters(
+        chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
-
-    for chapter_file in chapter_files:
-        # Force m4a extension for chapter files with Orpheus to avoid issues
-        if MODEL == "orpheus":
-            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
-        else:
-            chapter_path = chapter_file
-        # Debugging
-        print(f"Chapter file: {chapter_file}")
-        print(f"Chapter path: {chapter_path}")
-
-        # Create a temporary file list for this chapter's lines
-        chapter_lines_list = os.path.join(
-            f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
-        )
-        # Debugging
-        print(f"Chapter lines list: {chapter_lines_list}")
-        # Delete the chapter_lines_list file if it exists
-        if os.path.exists(chapter_lines_list):
-            os.remove(chapter_lines_list)
-
-        with open(chapter_lines_list, "w", encoding="utf-8") as f:
-            for line_index in sorted(chapter_line_map[chapter_file]):
-                line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
-                )
-                # Use absolute path to prevent path duplication issues
-                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
-                # Debugging
-                print(f"Added line {line_index} to chapter {chapter_file}")
-                print(f"Line audio path: {line_audio_path}")
-                print(f"Chapter path: {chapter_path}")
-
-        # Use FFmpeg to concatenate the lines
-        if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly
-            ffmpeg_cmd = (
-                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
-            )
-        else:
-            # For other models, we can use copy
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
-
-        # Print the command for debugging
-        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
-        try:
-            result = subprocess.run(
-                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
-            )
-            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
-            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
-            print(f"[ERROR] Command: {ffmpeg_cmd}")
-            print(f"[ERROR] Stdout: {e.stdout}")
-            print(f"[ERROR] Stderr: {e.stderr}")
-            raise e
-
-        chapter_assembly_bar.update(1)
-        yield f"Assembled chapter: {chapter_file}"
-
-        # Clean up the temporary file list
-        os.remove(chapter_lines_list)
-
-    chapter_assembly_bar.close()
 
     # Post-processing steps
     post_processing_bar = tqdm(
@@ -739,6 +812,7 @@ async def generate_audio_with_multiple_voices(
     narrator_voice = find_voice_for_gender_score(
         "narrator", character_gender_map, voice_map
     )
+    print(f"DEBUG: Narrator voice assigned: '{narrator_voice}'")
     yield "Loaded voice mappings and selected narrator voice"
 
     # Setup directories
@@ -785,8 +859,12 @@ async def generate_audio_with_multiple_voices(
                 return None
 
             speaker = doc["speaker"]
+            print(f"DEBUG: Processing line {line_index}, speaker: '{speaker}'")
             speaker_voice = find_voice_for_gender_score(
                 speaker, character_gender_map, voice_map
+            )
+            print(
+                f"DEBUG: Line {line_index}, speaker '{speaker}' assigned voice: '{speaker_voice}'"
             )
 
             annotated_parts = split_and_annotate_text(line)
@@ -1057,9 +1135,12 @@ async def generate_audio_with_multiple_voices(
         if result["is_chapter_heading"]:
             chapter_index += 1
 
-            current_chapter_audio = (
-                f"{sanitize_filename(result['line'])}.{output_format}"
-            )
+            if MODEL == "orpheus":
+                current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
+            else:
+                current_chapter_audio = (
+                    f"{sanitize_filename(result['line'])}.{output_format}"
+                )
 
         if current_chapter_audio not in chapter_files:
             chapter_files.append(current_chapter_audio)
@@ -1072,68 +1153,9 @@ async def generate_audio_with_multiple_voices(
     chapter_organization_bar.close()
     yield f"Organized {len(results)} lines into {len(chapter_files)} chapters"
 
-    # Third pass: Concatenate audio files for each chapter in order
-    chapter_assembly_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    concatenate_chapters(
+        chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
-
-    for chapter_file in chapter_files:
-        # Force m4a extension for chapter files with Orpheus to avoid issues
-        if MODEL == "orpheus":
-            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
-        else:
-            chapter_path = chapter_file
-        # Debugging
-        print(f"Chapter file: {chapter_file}")
-        print(f"Chapter path: {chapter_path}")
-
-        # Create a temporary file list for this chapter's lines
-        chapter_lines_list = f"{TEMP_DIR}/{book_title}/chapter_lines_list.txt"
-        with open(chapter_lines_list, "w", encoding="utf-8") as f:
-            for line_index in sorted(chapter_line_map[chapter_file]):
-                line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
-                )
-                # Use absolute path to prevent path duplication issues
-                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
-                # Debugging
-                print(f"Added line {line_index} to chapter {chapter_file}")
-                print(f"Line audio path: {line_audio_path}")
-                print(f"Chapter path: {chapter_path}")
-
-        # Use FFmpeg to concatenate the lines
-        if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly
-            ffmpeg_cmd = (
-                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
-            )
-        else:
-            # For other models, we can use copy
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
-
-        # Print the command for debugging
-        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
-        try:
-            result = subprocess.run(
-                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
-            )
-            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
-            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
-            print(f"[ERROR] Command: {ffmpeg_cmd}")
-            print(f"[ERROR] Stdout: {e.stdout}")
-            print(f"[ERROR] Stderr: {e.stderr}")
-            raise e
-
-        chapter_assembly_bar.update(1)
-        yield f"Assembled chapter: {chapter_file}"
-
-        # Clean up the temporary file list
-        os.remove(chapter_lines_list)
-
-    chapter_assembly_bar.close()
 
     # Post-processing steps
     post_processing_bar = tqdm(
@@ -1207,15 +1229,18 @@ async def process_audiobook_generation(
         raise Exception(message)
 
     generate_m4b_audiobook_file = False
+    # Determine the actual format to use for intermediate files
+    actual_output_format = output_format
 
     if output_format == "M4B (Chapters & Cover)":
         generate_m4b_audiobook_file = True
+        actual_output_format = "m4a"  # Use m4a for intermediate files when creating M4B
 
     if voice_option == "Single Voice":
         yield "\n🎧 Generating audiobook with a **single voice**..."
         await asyncio.sleep(1)
         async for line in generate_audio_with_single_voice(
-            output_format.lower(),
+            actual_output_format.lower(),
             narrator_gender,
             generate_m4b_audiobook_file,
             book_path,
@@ -1226,7 +1251,7 @@ async def process_audiobook_generation(
         yield "\n🎭 Generating audiobook with **multiple voices**..."
         await asyncio.sleep(1)
         async for line in generate_audio_with_multiple_voices(
-            output_format.lower(),
+            actual_output_format.lower(),
             narrator_gender,
             generate_m4b_audiobook_file,
             book_path,
@@ -1370,8 +1395,4 @@ async def test_single_voice():
 
 
 if __name__ == "__main__":
-    # asyncio.run(main())
-    ## create book txt file
-
-    ## create m4b file
-    asyncio.run(test_single_voice())
+    asyncio.run(main())

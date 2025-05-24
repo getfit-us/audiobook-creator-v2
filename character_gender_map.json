@@ -26,15 +26,15 @@
         },
         "sam": {
             "name": "sam",
-            "age": "child",
-            "gender": "male",
-            "gender_score": 4
+            "age": "adult",
+            "gender": "unknown",
+            "gender_score": 5
         },
         "ellie": {
             "name": "ellie",
             "age": "adult",
             "gender": "female",
-            "gender_score": 8
+            "gender_score": 9
         },
         "jack": {
             "name": "jack",
@@ -46,7 +46,7 @@
             "name": "luna",
             "age": "adult",
             "gender": "female",
-            "gender_score": 7
+            "gender_score": 8
         }
     }
 }
