@@ -1,1 +1,1 @@
-{}
+{"audiobook_1748124677_test_llm": {"status": "failed", "progress": "Generation failed", "timestamp": "2025-05-24T18:13:06.968590", "error": "ffprobe failed to get duration for temp/test_llm/Introduction.m4a.m4a"}}

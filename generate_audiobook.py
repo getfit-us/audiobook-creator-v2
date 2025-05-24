@@ -636,25 +636,25 @@ async def generate_audio_with_single_voice(
     )
 
     # Add silence to each chapter file
-    for chapter in chapter_files:
+    for chapter_file in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(
-            f"{TEMP_DIR}/{book_title}", chapter, output_format
+            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
         )
         post_processing_bar.update(1)
-        yield f"Added silence to chapter: {chapter}"
+        yield f"Added silence to chapter: {chapter_file}"
 
     m4a_chapter_files = []
 
     # Convert all chapter files to M4A format
-    for chapter in chapter_files:
-        chapter_name = chapter.split(f".{output_format}")[0]
+    for chapter_file in chapter_files:
+        chapter_name = chapter_file.split(f".{output_format}")[0]
         m4a_chapter_files.append(f"{chapter_name}.m4a")
         # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
         convert_audio_file_formats(
             output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
         )
         post_processing_bar.update(1)
-        yield f"Converted chapter to M4A: {chapter_name}"
+        yield f"Converted chapter: {chapter_file}"
 
     post_processing_bar.close()
 
@@ -1143,7 +1143,7 @@ async def generate_audio_with_multiple_voices(
     # Add silence to each chapter file
     for chapter_file in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(
-            TEMP_DIR, chapter_file, output_format
+            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
         )
         post_processing_bar.update(1)
         yield f"Added silence to chapter: {chapter_file}"
@@ -1155,7 +1155,9 @@ async def generate_audio_with_multiple_voices(
         chapter_name = chapter_file.split(f".{output_format}")[0]
         m4a_chapter_files.append(f"{chapter_name}.m4a")
         # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(output_format, "m4a", TEMP_DIR, chapter_name)
+        convert_audio_file_formats(
+            output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
+        )
         post_processing_bar.update(1)
         yield f"Converted chapter: {chapter_file}"
 
