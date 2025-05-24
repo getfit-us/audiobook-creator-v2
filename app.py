@@ -76,19 +76,52 @@ def get_active_tasks():
     """Get list of active generation tasks"""
     tasks = load_tasks()
     active_tasks = []
+    current_time = datetime.now()
+    tasks_to_clean = []
+
     for task_id, task_info in tasks.items():
-        if task_info.get("status") in ["running", "starting"]:
-            # Check if task is still actually running (simple heuristic)
+        try:
             timestamp = datetime.fromisoformat(task_info["timestamp"])
-            if (datetime.now() - timestamp).seconds < 300:  # 5 minutes timeout
-                active_tasks.append(
-                    {
-                        "id": task_id,
-                        "progress": task_info.get("progress", ""),
-                        "timestamp": task_info["timestamp"],
-                    }
-                )
+            hours_old = (current_time - timestamp).total_seconds() / 3600
+
+            # Automatically remove very old tasks (older than 6 hours)
+            if hours_old > 6:
+                tasks_to_clean.append(task_id)
+                continue
+
+            if task_info.get("status") in ["running", "starting"]:
+                # Check if task is still actually running (simple heuristic)
+                if hours_old < 5:  # 5 hours timeout (changed from minutes)
+                    active_tasks.append(
+                        {
+                            "id": task_id,
+                            "progress": task_info.get("progress", ""),
+                            "timestamp": task_info["timestamp"],
+                        }
+                    )
+                else:
+                    # Mark old running tasks for cleanup
+                    tasks_to_clean.append(task_id)
+        except:
+            # Mark tasks with invalid timestamps for cleanup
+            tasks_to_clean.append(task_id)
+
+    # Clean up old tasks
+    if tasks_to_clean:
+        for task_id in tasks_to_clean:
+            if task_id in tasks:
+                del tasks[task_id]
+        save_tasks(tasks)
+
     return active_tasks
+
+
+def remove_task(task_id):
+    """Remove a task from the tasks file"""
+    tasks = load_tasks()
+    if task_id in tasks:
+        del tasks[task_id]
+        save_tasks(tasks)
 
 
 def get_past_generated_files():
@@ -240,7 +273,9 @@ def text_extraction_wrapper(book_file, text_decoding_option, book_title):
     try:
         last_output = None
         # Pass through all yield values from the original function
-        for output in process_book_and_extract_text(book_file, text_decoding_option):
+        for output in process_book_and_extract_text(
+            book_file, text_decoding_option, book_title
+        ):
             last_output = output
             yield output  # Yield each progress update
 
@@ -385,6 +420,55 @@ async def generate_audiobook_wrapper(
         return
 
 
+def clear_old_tasks(keep_recent_hours=24):
+    """Clear old completed/failed tasks and very old tasks"""
+    tasks = load_tasks()
+    current_time = datetime.now()
+    tasks_removed = 0
+
+    tasks_to_remove = []
+    for task_id, task_info in tasks.items():
+        try:
+            task_time = datetime.fromisoformat(task_info["timestamp"])
+            hours_old = (current_time - task_time).total_seconds() / 3600
+
+            # Remove completed or failed tasks
+            if task_info.get("status") in ["completed", "failed"]:
+                tasks_to_remove.append(task_id)
+                tasks_removed += 1
+            # Remove very old tasks regardless of status
+            elif hours_old > keep_recent_hours:
+                tasks_to_remove.append(task_id)
+                tasks_removed += 1
+        except:
+            # Remove tasks with invalid timestamps
+            tasks_to_remove.append(task_id)
+            tasks_removed += 1
+
+    # Remove the identified tasks
+    for task_id in tasks_to_remove:
+        del tasks[task_id]
+
+    save_tasks(tasks)
+    return tasks_removed
+
+
+def clear_old_tasks_wrapper():
+    """Wrapper for clearing old tasks with user feedback"""
+    try:
+        tasks_removed = clear_old_tasks()
+        if tasks_removed > 0:
+            return gr.Info(
+                f"Cleared {tasks_removed} old task(s) from the tracking system.",
+                duration=5,
+            )
+        else:
+            return gr.Info("No old tasks to clear.", duration=3)
+    except Exception as e:
+        print(f"Error clearing old tasks: {e}")
+        return gr.Warning(f"Error clearing old tasks: {str(e)}")
+
+
 with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     gr.Markdown("# 📖 Audiobook Creator")
     gr.Markdown("Create professional audiobooks from your ebooks in just a few steps.")
@@ -521,6 +605,14 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 refresh_btn = gr.Button(
                     "🔄 Refresh List", variant="secondary", size="sm"
                 )
+                clear_tasks_btn = gr.Button(
+                    "🧹 Clear Old Tasks", variant="secondary", size="sm"
+                )
+
+            gr.Markdown(
+                "*Clear Old Tasks removes completed, failed, and very old generation tasks from the tracking system.*",
+                elem_classes=["text-sm", "text-muted"],
+            )
 
             past_files_display = gr.Markdown(
                 value="Click refresh to see generated audiobooks.", visible=True
@@ -610,6 +702,16 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
 
     # Refresh past files when the refresh button is clicked
     refresh_btn.click(
+        refresh_past_files,
+        outputs=[past_files_display, past_files_dropdown, delete_btn],
+    )
+
+    # Clear old tasks when the clear tasks button is clicked
+    clear_tasks_btn.click(
+        clear_old_tasks_wrapper,
+        outputs=[],
+    ).then(
+        # Refresh the display after clearing tasks to update the active tasks section
         refresh_past_files,
         outputs=[past_files_display, past_files_dropdown, delete_btn],
     )

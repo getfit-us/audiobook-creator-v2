@@ -26,6 +26,14 @@ import re
 from word2number import w2n
 import time
 import sys
+from book_to_txt import process_book_and_extract_text
+from config.constants import (
+    API_KEY,
+    BASE_URL,
+    MODEL,
+    MAX_PARALLEL_REQUESTS_BATCH_SIZE,
+    TEMP_DIR,
+)
 from utils.check_tts_api import check_tts_api
 from utils.run_shell_commands import (
     check_if_ffmpeg_is_installed,
@@ -35,7 +43,6 @@ from utils.file_utils import read_json, empty_directory
 from utils.audiobook_utils import (
     merge_chapters_to_m4b,
     convert_audio_file_formats,
-    add_silence_to_audio_file_by_reencoding_using_ffmpeg,
     merge_chapters_to_standard_audio_file,
     add_silence_to_audio_file_by_appending_pre_generated_silence,
 )
@@ -45,21 +52,9 @@ import subprocess
 
 load_dotenv()
 
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8880/v1")
-API_KEY = os.environ.get("API_KEY", "not-needed")
-MODEL = os.environ.get("MODEL", "kokoro")
-MAX_PARALLEL_REQUESTS_BATCH_SIZE = int(
-    os.environ.get("MAX_PARALLEL_REQUESTS_BATCH_SIZE", 2)
-)
-VOICE_MAP = (
-    read_json("static_files/kokoro_voice_map_male_narrator.json")
-    if MODEL == "kokoro"
-    else read_json("static_files/orpheus_voice_map_male_narrator.json")
-)
 
-# When using Orpheus, we need to use WAV for line segments but M4A for final chapters to avoid format issues
-FORMAT = "wav" if MODEL == "orpheus" else "aac"
-CHAPTER_FORMAT = "m4a" if MODEL == "orpheus" else FORMAT
+API_OUTPUT_FORMAT = "wav" if MODEL == "orpheus" else "aac"
+
 os.makedirs("audio_samples", exist_ok=True)
 
 async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
@@ -160,6 +155,47 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
             return voice
 
 
+def preprocess_text_for_orpheus(text):
+    """
+    Preprocess text for Orpheus TTS to prevent repetition issues.
+    Adds full stops where necessary while handling edge cases.
+    """
+    if not text or len(text.strip()) == 0:
+        return text
+
+    text = text.strip()
+
+    # Don't modify very short text (single words or very short phrases)
+    if len(text) <= 3:
+        return text
+
+    # Check if text already ends with proper punctuation
+    punctuation_marks = {".", "!", "?", ":", ";", ",", '"', "'", ")", "]", "}"}
+    if text[-1] in punctuation_marks:
+        return text
+
+    # Handle dialogue - don't add period inside quotes
+    if text.startswith('"') and text.endswith('"'):
+        # For dialogue, check if there's already punctuation before the closing quote
+        if len(text) > 2 and text[-2] in {".", "!", "?", ",", ";", ":"}:
+            return text
+        else:
+            # Add period before closing quote
+            return text[:-1] + '."'
+
+    # Handle text that ends with quotes but doesn't start with them
+    if text.endswith('"') and not text.startswith('"'):
+        # Check if there's punctuation before the quote
+        if len(text) > 1 and text[-2] in {".", "!", "?", ",", ";", ":"}:
+            return text
+        else:
+            # Add period before the quote
+            return text[:-1] + '."'
+
+    # For regular narration text, add a period
+    return text + "."
+
+
 async def generate_audio_with_single_voice(
     output_format,
     narrator_gender,
@@ -187,7 +223,9 @@ async def generate_audio_with_single_voice(
              organizing by chapters, assembling chapters, and post-processing steps.
     """
 
-    with open("converted_book.txt", "r", encoding="utf-8") as f:
+    with open(
+        f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding="utf-8"
+    ) as f:
         text = f.read()
     lines = text.split("\n")
 
@@ -214,12 +252,11 @@ async def generate_audio_with_single_voice(
             dialogue_voice = "leah"
 
     # Setup directories
-    temp_audio_dir = "temp_audio"
-    temp_line_audio_dir = os.path.join(temp_audio_dir, "line_segments")
+    temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(temp_audio_dir)
+    empty_directory(os.path.join(temp_line_audio_dir, book_title))
 
-    os.makedirs(temp_audio_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(temp_line_audio_dir, exist_ok=True)
 
     # Batch processing parameters
@@ -227,10 +264,8 @@ async def generate_audio_with_single_voice(
 
     # Initial setup for chapters
     chapter_index = 1
-    if MODEL == "orpheus":
-        current_chapter_audio = "Introduction.m4a"
-    else:
-        current_chapter_audio = f"Introduction.{CHAPTER_FORMAT}"
+
+    current_chapter_audio = f"Introduction.{output_format}"
     chapter_files = []
 
     # First pass: Generate audio for each line independently
@@ -255,13 +290,19 @@ async def generate_audio_with_single_voice(
 
             for i, part in enumerate(annotated_parts):
                 text_to_speak = part["text"]
+
+                # Preprocess text for Orpheus to prevent repetition issues
+                if MODEL == "orpheus":
+                    text_to_speak = preprocess_text_for_orpheus(text_to_speak)
+
                 voice_to_speak_in = (
                     narrator_voice if part["type"] == "narration" else dialogue_voice
                 )
 
                 # Create temporary file for this part
                 part_file_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}_part_{i}.{FORMAT}"
+                    temp_line_audio_dir,
+                    f"line_{line_index:06d}_part_{i}.{API_OUTPUT_FORMAT}",
                 )
 
                 current_part_audio_buffer = bytearray()
@@ -269,7 +310,7 @@ async def generate_audio_with_single_voice(
                     async with async_openai_client.audio.speech.with_streaming_response.create(
                         model=MODEL,
                         voice=voice_to_speak_in,
-                        response_format=FORMAT,
+                        response_format=API_OUTPUT_FORMAT,
                         speed=0.85,
                         input=text_to_speak,
                     ) as response:
@@ -306,7 +347,7 @@ async def generate_audio_with_single_voice(
             # Concatenate all parts using FFmpeg
             if part_files:
                 final_line_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
 
                 if len(part_files) == 1:
@@ -347,22 +388,11 @@ async def generate_audio_with_single_voice(
                     ffmpeg_cmd = f'ffmpeg -y{input_args} -filter_complex "{filter_complex}" -map "[outa]" -c:a aac -b:a 256k \'{final_line_path}\''
 
                     # Debug: Print info about the parts before concatenation
-                    print(
-                        f"\n=== DEBUG: Line {line_index} has {len(part_files)} parts ==="
-                    )
-                    print(f"Line text: '{line[:100]}...'")
+                    # print(
+                    #     f"\n=== DEBUG: Line {line_index} has {len(part_files)} parts ==="
+                    # )
+                    # print(f"Line text: '{line[:100]}...'")
                     for i, part_file in enumerate(part_files):
-                        part_info = annotated_parts[i]
-                        print(
-                            f"Part {i}: {part_info['type']} - '{part_info['text'][:50]}...'"
-                        )
-                        print(f"  File: {part_file}")
-                        voice_type = (
-                            "narrator"
-                            if part_info["type"] == "narration"
-                            else "dialogue"
-                        )
-                        print(f"  Voice: {voice_type}")
 
                         # Check if file exists and get size
                         if os.path.exists(part_file):
@@ -371,13 +401,13 @@ async def generate_audio_with_single_voice(
                         else:
                             print(f"  ERROR: File does not exist!")
 
-                    print(f"FFmpeg command: {ffmpeg_cmd}")
-                    print(
-                        f"Proceeding with concatenation of {len(part_files)} parts..."
-                    )
+                    # print(f"FFmpeg command: {ffmpeg_cmd}")
+                    # print(
+                    #     f"Proceeding with concatenation of {len(part_files)} parts..."
+                    # )
 
-                    # Step 1: Normalize all parts to ensure compatibility
-                    print(f"Normalizing {len(part_files)} parts for concatenation...")
+                    # # Step 1: Normalize all parts to ensure compatibility
+                    # print(f"Normalizing {len(part_files)} parts for concatenation...")
                     normalized_parts = []
 
                     for i, part_file in enumerate(part_files):
@@ -434,7 +464,7 @@ async def generate_audio_with_single_voice(
                                 f.write(f"file '{os.path.abspath(norm_file)}'\n")
 
                         # Final concatenation to target format
-                        if FORMAT == "wav":
+                        if API_OUTPUT_FORMAT == "wav":
                             concat_cmd = [
                                 "ffmpeg",
                                 "-y",
@@ -539,7 +569,6 @@ async def generate_audio_with_single_voice(
 
     progress_bar.close()
 
-    # Filter out empty lines (same as in your original code)
     results = [r for r in results_all if r is not None]
 
     yield "Completed generating audio for all lines"
@@ -553,12 +582,9 @@ async def generate_audio_with_single_voice(
         # Check if this is a chapter heading
         if result["is_chapter_heading"]:
             chapter_index += 1
-            if MODEL == "orpheus":
-                current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
-            else:
-                current_chapter_audio = (
-                    f"{sanitize_filename(result['line'])}.{CHAPTER_FORMAT}"
-                )
+            current_chapter_audio = (
+                f"{sanitize_filename(result['line'])}.{output_format}"
+            )
 
         if current_chapter_audio not in chapter_files:
             chapter_files.append(current_chapter_audio)
@@ -580,17 +606,19 @@ async def generate_audio_with_single_voice(
         # Force m4a extension for chapter files with Orpheus to avoid issues
         if MODEL == "orpheus":
             chapter_path = os.path.join(
-                temp_audio_dir, f"{chapter_file.split('.')[0]}.m4a"
+                f"{TEMP_DIR}/{book_title}", f"{chapter_file.split('.')[0]}.m4a"
             )
         else:
-            chapter_path = os.path.join(temp_audio_dir, chapter_file)
+            chapter_path = os.path.join(f"{TEMP_DIR}/{book_title}", chapter_file)
 
         # Create a temporary file list for this chapter's lines
-        chapter_lines_list = "chapter_lines_list.txt"
+        chapter_lines_list = os.path.join(
+            f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
+        )
         with open(chapter_lines_list, "w", encoding="utf-8") as f:
             for line_index in sorted(chapter_line_map[chapter_file]):
                 line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
                 f.write(f"file '{line_audio_path}'\n")
 
@@ -639,7 +667,7 @@ async def generate_audio_with_single_voice(
     # Add silence to each chapter file
     for chapter in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(
-            temp_audio_dir, chapter, CHAPTER_FORMAT
+            f"{TEMP_DIR}/{book_title}", chapter, output_format
         )
         post_processing_bar.update(1)
         yield f"Added silence to chapter: {chapter}"
@@ -648,10 +676,12 @@ async def generate_audio_with_single_voice(
 
     # Convert all chapter files to M4A format
     for chapter in chapter_files:
-        chapter_name = chapter.split(f".{CHAPTER_FORMAT}")[0]
+        chapter_name = chapter.split(f".{output_format}")[0]
         m4a_chapter_files.append(f"{chapter_name}.m4a")
         # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(CHAPTER_FORMAT, "m4a", temp_audio_dir, chapter_name)
+        convert_audio_file_formats(
+            output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
+        )
         post_processing_bar.update(1)
         yield f"Converted chapter to M4A: {chapter_name}"
 
@@ -665,16 +695,16 @@ async def generate_audio_with_single_voice(
         # Merge all chapter files into a final m4b audiobook
         yield "Creating M4B audiobook file..."
         merge_chapters_to_m4b(book_path, m4a_chapter_files)
+        # clean the temp directory
+        shutil.rmtree(f"{TEMP_DIR}/{book_title}")
         yield "M4B audiobook created successfully"
     else:
         # Merge all chapter files into a standard M4A audiobook
         yield "Creating final audiobook..."
         merge_chapters_to_standard_audio_file(m4a_chapter_files)
-        # When using Orpheus, we've already generated m4a files
-        source_format = "m4a" if MODEL == "orpheus" else FORMAT
         safe_book_title = sanitize_book_title_for_filename(book_title)
         convert_audio_file_formats(
-            source_format, output_format, "generated_audiobooks", safe_book_title
+            API_OUTPUT_FORMAT, output_format, "generated_audiobooks", safe_book_title
         )
         yield f"Audiobook in {output_format} format created successfully"
 
@@ -741,24 +771,23 @@ async def generate_audio_with_multiple_voices(
     yield "Loaded voice mappings and selected narrator voice"
 
     # Setup directories
-    temp_audio_dir = "temp_audio"
-    temp_line_audio_dir = os.path.join(temp_audio_dir, "line_segments")
+    temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(temp_audio_dir)
+    empty_directory(os.path.join(TEMP_DIR, book_title))
 
-    os.makedirs(temp_audio_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(temp_line_audio_dir, exist_ok=True)
     yield "Set up temporary directories for audio processing"
 
     # Batch processing parameters
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS_BATCH_SIZE)
 
     # Initial setup for chapters
     chapter_index = 1
     if MODEL == "orpheus":
         current_chapter_audio = "Introduction.m4a"
     else:
-        current_chapter_audio = f"Introduction.{CHAPTER_FORMAT}"
+        current_chapter_audio = f"Introduction.{output_format}"
     chapter_files = []
 
     # First pass: Generate audio for each line independently
@@ -794,13 +823,19 @@ async def generate_audio_with_multiple_voices(
 
             for i, part in enumerate(annotated_parts):
                 text_to_speak = part["text"]
+
+                # Preprocess text for Orpheus to prevent repetition issues
+                if MODEL == "orpheus":
+                    text_to_speak = preprocess_text_for_orpheus(text_to_speak)
+
                 voice_to_speak_in = (
                     narrator_voice if part["type"] == "narration" else speaker_voice
                 )
 
                 # Create temporary file for this part
                 part_file_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}_part_{i}.{FORMAT}"
+                    temp_line_audio_dir,
+                    f"line_{line_index:06d}_part_{i}.{API_OUTPUT_FORMAT}",
                 )
 
                 current_part_audio_buffer = bytearray()
@@ -810,7 +845,7 @@ async def generate_audio_with_multiple_voices(
                     async with async_openai_client.audio.speech.with_streaming_response.create(
                         model=MODEL,
                         voice=voice_to_speak_in,
-                        response_format=FORMAT,
+                        response_format=API_OUTPUT_FORMAT,
                         speed=0.85,
                         input=text_to_speak,
                     ) as response:
@@ -851,7 +886,7 @@ async def generate_audio_with_multiple_voices(
             # Concatenate all parts using FFmpeg
             if part_files:
                 final_line_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
 
                 if len(part_files) == 1:
@@ -929,7 +964,7 @@ async def generate_audio_with_multiple_voices(
                                 f.write(f"file '{os.path.abspath(norm_file)}'\n")
 
                         # Final concatenation to target format
-                        if FORMAT == "wav":
+                        if API_OUTPUT_FORMAT == "wav":
                             concat_cmd = [
                                 "ffmpeg",
                                 "-y",
@@ -1050,12 +1085,10 @@ async def generate_audio_with_multiple_voices(
         # Check if this is a chapter heading
         if result["is_chapter_heading"]:
             chapter_index += 1
-            if MODEL == "orpheus":
-                current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
-            else:
-                current_chapter_audio = (
-                    f"{sanitize_filename(result['line'])}.{CHAPTER_FORMAT}"
-                )
+
+            current_chapter_audio = (
+                f"{sanitize_filename(result['line'])}.{output_format}"
+            )
 
         if current_chapter_audio not in chapter_files:
             chapter_files.append(current_chapter_audio)
@@ -1076,18 +1109,16 @@ async def generate_audio_with_multiple_voices(
     for chapter_file in chapter_files:
         # Force m4a extension for chapter files with Orpheus to avoid issues
         if MODEL == "orpheus":
-            chapter_path = os.path.join(
-                temp_audio_dir, f"{chapter_file.split('.')[0]}.m4a"
-            )
+            chapter_path = os.path.join(TEMP_DIR, f"{chapter_file.split('.')[0]}.m4a")
         else:
-            chapter_path = os.path.join(temp_audio_dir, chapter_file)
+            chapter_path = os.path.join(TEMP_DIR, chapter_file)
 
         # Create a temporary file list for this chapter's lines
         chapter_lines_list = "chapter_lines_list.txt"
         with open(chapter_lines_list, "w", encoding="utf-8") as f:
             for line_index in sorted(chapter_line_map[chapter_file]):
                 line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
                 f.write(f"file '{line_audio_path}'\n")
 
@@ -1133,7 +1164,7 @@ async def generate_audio_with_multiple_voices(
     # Add silence to each chapter file
     for chapter_file in chapter_files:
         add_silence_to_audio_file_by_appending_pre_generated_silence(
-            temp_audio_dir, chapter_file, CHAPTER_FORMAT
+            TEMP_DIR, chapter_file, output_format
         )
         post_processing_bar.update(1)
         yield f"Added silence to chapter: {chapter_file}"
@@ -1142,10 +1173,10 @@ async def generate_audio_with_multiple_voices(
 
     # Convert all chapter files to M4A format
     for chapter_file in chapter_files:
-        chapter_name = chapter_file.split(f".{CHAPTER_FORMAT}")[0]
+        chapter_name = chapter_file.split(f".{output_format}")[0]
         m4a_chapter_files.append(f"{chapter_name}.m4a")
         # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(CHAPTER_FORMAT, "m4a", temp_audio_dir, chapter_name)
+        convert_audio_file_formats(output_format, "m4a", TEMP_DIR, chapter_name)
         post_processing_bar.update(1)
         yield f"Converted chapter: {chapter_file}"
 
@@ -1187,11 +1218,11 @@ async def process_audiobook_generation(
         else:
             narrator_voice = "tara"
 
-    is_kokoro_api_up, message = await check_tts_api(
+    is_tts_api_up, message = await check_tts_api(
         async_openai_client, MODEL, narrator_voice
     )
 
-    if not is_kokoro_api_up:
+    if not is_tts_api_up:
         raise Exception(message)
 
     generate_m4b_audiobook_file = False
@@ -1225,8 +1256,8 @@ async def process_audiobook_generation(
     yield f"\n🎧 Audiobook is generated ! You can now download it in the Download section below. Click on the blue download link next to the file name."
 
 
-async def main():
-    os.makedirs("generated_audiobooks", exist_ok=True)
+async def main(book_title: str):
+    os.makedirs(f"{TEMP_DIR}/{book_title}/generated_audiobooks", exist_ok=True)
 
     # Default values
     book_path = "./sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub"
@@ -1335,5 +1366,30 @@ async def main():
     )
 
 
+async def test_single_voice():
+    """Wrapper function to test single voice generation"""
+    book_path = (
+        "sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub"
+    )
+
+    print("📖 Processing book and extracting text...")
+    # Consume the generator to actually execute the function
+    for output in process_book_and_extract_text(
+        book_path, "textract", "The Adventure of the Lost Treasure"
+    ):
+        pass
+    async for progress in generate_audio_with_single_voice(
+        "m4a",
+        "male",
+        True,
+        "converted_book.txt",
+        "The Adventure of the Lost Treasure",
+    ):
+        print(progress)
+
+
 if __name__ == "__main__":
     asyncio.run(main())
+    ## create book txt file
+
+    # asyncio.run(test_single_voice())

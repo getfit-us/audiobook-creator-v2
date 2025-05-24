@@ -20,7 +20,37 @@ import subprocess
 import re
 import os
 import traceback
+from config.constants import TEMP_DIR
 from utils.run_shell_commands import run_shell_command
+
+
+def create_default_cover_image():
+    """
+    Creates a simple default cover image using FFmpeg if cover.jpg doesn't exist.
+    """
+    if not os.path.exists("cover.jpg"):
+        try:
+            # Create a simple black cover image with text using FFmpeg
+            cmd = [
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=600x600:duration=1",
+                "-vf",
+                "drawtext=text='Audiobook':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=48:fontcolor=white",
+                "-frames:v",
+                "1",
+                "cover.jpg",
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                print("Created default cover image: cover.jpg")
+            else:
+                print("Warning: Could not create default cover image")
+        except Exception as e:
+            print(f"Warning: Could not create default cover image: {e}")
 
 
 # Escape double quotes by replacing them with \"
@@ -40,23 +70,71 @@ def get_ebook_metadata_with_cover(book_path):
     Returns:
         dict: A dictionary containing the ebook's metadata.
     """
-    ebook_meta_bin_result = run_shell_command("which ebook-meta")
-    ebook_meta_bin_path = ebook_meta_bin_result.stdout.strip()
+    try:
+        ebook_meta_bin_result = run_shell_command("which ebook-meta")
 
-    # Command to extract metadata and cover image using ebook-meta
-    command = f"{ebook_meta_bin_path} '{book_path}' --get-cover cover.jpg"
+        # Check if ebook-meta was found
+        if ebook_meta_bin_result is None or not ebook_meta_bin_result.stdout.strip():
+            print("Warning: ebook-meta not found. Using default metadata for M4B file.")
+            # Create a simple default cover image if it doesn't exist
+            create_default_cover_image()
+            # Return default metadata when ebook-meta is not available
+            return {
+                "Title": "Audiobook",
+                "Author(s)": "Unknown",
+                "Publisher": "Unknown",
+                "Languages": "en",
+                "Published": "Unknown",
+                "Comments": "Generated audiobook",
+            }
 
-    # Run the command and capture the result
-    result = run_shell_command(command)
+        ebook_meta_bin_path = ebook_meta_bin_result.stdout.strip()
 
-    metadata = {}
-    # Parse the command output to extract metadata
-    for line in result.stdout.split("\n"):
-        if ": " in line:
-            key, value = line.split(": ", 1)
-            metadata[key.strip()] = value.strip()
+        # Command to extract metadata and cover image using ebook-meta
+        command = f"{ebook_meta_bin_path} '{book_path}' --get-cover cover.jpg"
 
-    return metadata
+        # Run the command and capture the result
+        result = run_shell_command(command)
+
+        if result is None:
+            print(
+                "Warning: Failed to extract metadata. Using default metadata for M4B file."
+            )
+            # Create a simple default cover image if extraction failed
+            create_default_cover_image()
+            return {
+                "Title": "Audiobook",
+                "Author(s)": "Unknown",
+                "Publisher": "Unknown",
+                "Languages": "en",
+                "Published": "Unknown",
+                "Comments": "Generated audiobook",
+            }
+
+        metadata = {}
+        # Parse the command output to extract metadata
+        for line in result.stdout.split("\n"):
+            if ": " in line:
+                key, value = line.split(": ", 1)
+                metadata[key.strip()] = value.strip()
+
+        return metadata
+
+    except Exception as e:
+        print(
+            f"Warning: Error extracting metadata: {e}. Using default metadata for M4B file."
+        )
+        # Create a simple default cover image if there was an exception
+        create_default_cover_image()
+        # Return default metadata when there's an error
+        return {
+            "Title": "Audiobook",
+            "Author(s)": "Unknown",
+            "Publisher": "Unknown",
+            "Languages": "en",
+            "Published": "Unknown",
+            "Comments": "Generated audiobook",
+        }
 
 
 def get_audio_duration_using_ffprobe(file_path):
@@ -121,12 +199,10 @@ def generate_chapters_file(chapter_files, output_file="chapters.txt"):
         output_file (str): The path to the output chapter metadata file. Defaults to "chapters.txt".
     """
     start_time = 0
-    with open(output_file, "w", encoding="utf-8") as f:
+    with open(f"{TEMP_DIR}/{output_file}", "w", encoding="utf-8") as f:
         f.write(";FFMETADATA1\n")
         for chapter in chapter_files:
-            duration = get_audio_duration_using_ffprobe(
-                os.path.join("temp_audio", chapter)
-            )
+            duration = get_audio_duration_using_ffprobe(os.path.join(TEMP_DIR, chapter))
             end_time = start_time + duration
 
             # Write the chapter metadata to the file
@@ -323,7 +399,7 @@ def merge_chapters_to_m4b(book_path, chapter_files):
 
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
-            f.write(f"file '{os.path.join('temp_audio', chapter)}'\n")
+            f.write(f"file '{os.path.join(TEMP_DIR, chapter)}'\n")
 
     metadata = get_ebook_metadata_with_cover(book_path)
     title = escape_metadata(metadata.get("Title", ""))
@@ -363,29 +439,13 @@ def merge_chapters_to_m4b(book_path, chapter_files):
 def add_silence_to_audio_file_by_appending_pre_generated_silence(
     temp_dir, input_file_name, format
 ):
-    silence_path = "static_files/silence.aac"  # Pre generated 1 seconds of silence using command `ffmpeg -f lavfi -i anullsrc=r=44100:cl=mono -t 1 -c:a aac silence.aac`
+    silence_path = "static_files/silence.aac"
 
-    if format == "aac":
-        with open(silence_path, "rb") as silence_file, open(
+    
+    with open(silence_path, "rb") as silence_file, open(
             f"{temp_dir}/{input_file_name}", "ab"
         ) as audio_file:
-            audio_file.write(
-                silence_file.read()
-            )  # Append silence to the end of the audio file
-    elif format == "m4a":
-        with open(silence_path, "rb") as silence_file, open(
-            f"{temp_dir}/{input_file_name}", "ab"
-        ) as audio_file:
-            audio_file.write(
-                silence_file.read()
-            )  # Append silence to the end of the audio file
-    elif format == "wav":
-        with open(silence_path, "rb") as silence_file, open(
-            f"{temp_dir}/{input_file_name}", "ab"
-        ) as audio_file:
-            audio_file.write(
-                silence_file.read()
-            )  # Append silence to the end of the audio file
+        audio_file.write(silence_file.read())
 
 
 def add_silence_to_audio_file_by_reencoding_using_ffmpeg(
@@ -404,12 +464,12 @@ def add_silence_to_audio_file_by_reencoding_using_ffmpeg(
     subprocess.run(generate_silence_command, shell=True, check=True)
 
     # Add the silence to the end of the audio file
-    add_silence_command = f'ffmpeg -y -i "{temp_dir}/{input_file_name}" -i "{temp_dir}/silence.aac" -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" "{temp_dir}/temp_audio_file.aac"'
+    add_silence_command = f'ffmpeg -y -i "{temp_dir}/{input_file_name}" -i "{temp_dir}/silence.aac" -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" "{temp_dir}/temp_dir_file.aac"'
     subprocess.run(add_silence_command, shell=True, check=True)
 
     # Rename the temporary file back to the original file name
     rename_file_command = (
-        f'mv "{temp_dir}/temp_audio_file.aac" "{temp_dir}/{input_file_name}"'
+        f'mv "{temp_dir}/temp_dir_file.aac" "{temp_dir}/{input_file_name}"'
     )
     subprocess.run(rename_file_command, shell=True, check=True)
 
@@ -428,7 +488,7 @@ def merge_chapters_to_standard_audio_file(chapter_files):
     # Write the list of chapter files to a text file (ffmpeg input)
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
-            f.write(f"file '{os.path.join('temp_audio', chapter)}'\n")
+            f.write(f"file '{os.path.join(TEMP_DIR, chapter)}'\n")
 
     # Construct the output file path
     output_file = f"generated_audiobooks/audiobook.m4a"
