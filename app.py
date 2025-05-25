@@ -19,9 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import gradio as gr
 import os
 import traceback
-import glob
-import json
-import time
+
 from datetime import datetime
 from fastapi import FastAPI
 from book_to_txt import process_book_and_extract_text, save_book
@@ -29,139 +27,22 @@ from identify_characters_and_output_book_to_jsonl import (
     process_book_and_identify_characters,
 )
 from generate_audiobook import process_audiobook_generation
+from utils.task_utils import (
+    get_active_tasks,
+    get_past_generated_files,
+    load_tasks,
+    save_tasks,
+    update_task_status,
+    cancel_task,
+    register_running_task,
+    unregister_running_task,
+)
 
 css = """
 .step-heading {font-size: 1.2rem; font-weight: bold; margin-bottom: 0.5rem}
 """
 
 app = FastAPI()
-
-# Simple task tracking for background processes
-TASKS_FILE = "generation_tasks.json"
-
-
-def load_tasks():
-    """Load current tasks from file"""
-    try:
-        if os.path.exists(TASKS_FILE):
-            with open(TASKS_FILE, "r") as f:
-                return json.load(f)
-    except:
-        pass
-    return {}
-
-
-def save_tasks(tasks):
-    """Save tasks to file"""
-    try:
-        with open(TASKS_FILE, "w") as f:
-            json.dump(tasks, f)
-    except:
-        pass
-
-
-def update_task_status(task_id, status, progress="", error=None):
-    """Update task status"""
-    tasks = load_tasks()
-    tasks[task_id] = {
-        "status": status,
-        "progress": progress,
-        "timestamp": datetime.now().isoformat(),
-        "error": error,
-    }
-    save_tasks(tasks)
-
-
-def get_active_tasks():
-    """Get list of active generation tasks"""
-    tasks = load_tasks()
-    active_tasks = []
-    current_time = datetime.now()
-    tasks_to_clean = []
-
-    for task_id, task_info in tasks.items():
-        try:
-            timestamp = datetime.fromisoformat(task_info["timestamp"])
-            hours_old = (current_time - timestamp).total_seconds() / 3600
-
-            # Automatically remove very old tasks (older than 48 hours)
-            if hours_old > 48:
-                tasks_to_clean.append(task_id)
-                continue
-
-            if task_info.get("status") in ["running", "starting"]:
-                # Check if task is still actually running (simple heuristic)
-                if hours_old < 5:  # 5 hours timeout (changed from minutes)
-                    active_tasks.append(
-                        {
-                            "id": task_id,
-                            "progress": task_info.get("progress", ""),
-                            "timestamp": task_info["timestamp"],
-                        }
-                    )
-                else:
-                    # Mark old running tasks for cleanup
-                    tasks_to_clean.append(task_id)
-        except:
-            # Mark tasks with invalid timestamps for cleanup
-            tasks_to_clean.append(task_id)
-
-    # Clean up old tasks
-    if tasks_to_clean:
-        for task_id in tasks_to_clean:
-            if task_id in tasks:
-                del tasks[task_id]
-        save_tasks(tasks)
-
-    return active_tasks
-
-
-def remove_task(task_id):
-    """Remove a task from the tasks file"""
-    tasks = load_tasks()
-    if task_id in tasks:
-        del tasks[task_id]
-        save_tasks(tasks)
-
-
-def get_past_generated_files():
-    """Get list of past generated audiobook files"""
-    try:
-        audiobooks_dir = "generated_audiobooks"
-        if not os.path.exists(audiobooks_dir):
-            return []
-
-        # Get all files in the generated_audiobooks directory
-        pattern = os.path.join(audiobooks_dir, "*")
-        files = glob.glob(pattern)
-
-        # Filter out directories and get file info
-        audiobook_files = []
-        for file_path in files:
-            if os.path.isfile(file_path):
-                filename = os.path.basename(file_path)
-                # Get file size and modification time
-                stat_info = os.stat(file_path)
-                size_mb = round(stat_info.st_size / (1024 * 1024), 2)
-                mod_time = datetime.fromtimestamp(stat_info.st_mtime).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-
-                audiobook_files.append(
-                    {
-                        "path": file_path,
-                        "filename": filename,
-                        "size_mb": size_mb,
-                        "modified": mod_time,
-                    }
-                )
-
-        # Sort by modification time (newest first)
-        audiobook_files.sort(key=lambda x: os.path.getmtime(x["path"]), reverse=True)
-        return audiobook_files
-    except Exception as e:
-        print(f"Error getting past files: {e}")
-        return []
 
 
 def delete_audiobook_file(file_path):
@@ -204,6 +85,27 @@ def get_selected_file_info(file_path):
         return f"Error reading file info: {str(e)}"
 
 
+def delete_audiobook_file(file_path):
+    """Delete an audiobook file and return status message"""
+    if not file_path:
+        return gr.Warning("No file selected for deletion.")
+
+    try:
+        if os.path.exists(file_path):
+            filename = os.path.basename(file_path)
+            file_size = round(os.path.getsize(file_path) / (1024 * 1024), 2)
+            os.remove(file_path)
+            return gr.Info(
+                f"Successfully deleted '{filename}' ({file_size} MB).", duration=5
+            )
+        else:
+            return gr.Warning("File not found. It may have already been deleted.")
+    except PermissionError:
+        return gr.Warning("Permission denied. Cannot delete the file.")
+    except Exception as e:
+        return gr.Warning(f"Error deleting file: {str(e)}")
+
+
 def refresh_past_files():
     """Refresh the list of past generated files"""
     files = get_past_generated_files()
@@ -216,7 +118,9 @@ def refresh_past_files():
     if active_tasks:
         display_parts.append("### 🔄 Currently Running:")
         for task in active_tasks:
-            task_display = f"⏳ **Generation in progress** - {task['progress']} ({task['timestamp'][:16]})"
+            task_display = (
+                f"⏳ **{task['id']}** - {task['progress']} ({task['timestamp'][:16]})"
+            )
             display_parts.append(task_display)
         display_parts.append("")  # Empty line
 
@@ -235,6 +139,7 @@ def refresh_past_files():
             file_choices.append((file_info["filename"], file_info["path"]))
 
         file_text = "\n\n".join(display_parts)
+        dropdown_update, group_update = get_active_tasks_for_dropdown()
         return (
             gr.update(value=file_text, visible=True),
             gr.update(
@@ -243,13 +148,18 @@ def refresh_past_files():
                 visible=bool(file_choices),
             ),
             gr.update(visible=bool(file_choices)),
+            dropdown_update,  # Return active tasks dropdown update
+            group_update,  # Return cancel task group visibility update
         )  # Show delete button if files exist
 
     file_text = "\n\n".join(display_parts)
+    dropdown_update, group_update = get_active_tasks_for_dropdown()
     return (
         gr.update(value=file_text, visible=True),
         gr.update(choices=[], value=None, visible=False),
         gr.update(visible=False),
+        dropdown_update,  # Return active tasks dropdown update
+        group_update,  # Return cancel task group visibility update
     )  # Hide delete button if no files
 
 
@@ -357,7 +267,7 @@ async def generate_audiobook_wrapper(
         return
 
     # Create a unique task ID for tracking
-    task_id = f"audiobook_{int(time.time())}_{book_title[:20].replace(' ', '_')}"
+    task_id = f"{book_title}_{voice_type}_{narrator_gender}_{output_format}"
 
     try:
         # Mark task as starting
@@ -367,11 +277,17 @@ async def generate_audiobook_wrapper(
             f"Initializing {voice_type} audiobook generation for '{book_title}'",
         )
 
+        # Register the current task for cancellation
+        import asyncio
+
+        current_task = asyncio.current_task()
+        register_running_task(task_id, current_task)
+
         last_output = None
         audiobook_path = None
         # Pass through all yield values from the original function
         async for output in process_audiobook_generation(
-            voice_type, narrator_gender, output_format, book_file, book_title
+            voice_type, narrator_gender, output_format, book_file, book_title, task_id
         ):
             last_output = output
             # Update task status with current progress
@@ -403,6 +319,9 @@ async def generate_audiobook_wrapper(
             f"Audiobook generated successfully: {safe_book_title}.{file_extension}",
         )
 
+        # Unregister the task
+        unregister_running_task(task_id)
+
         # Final yield with success notification and file path
         yield gr.Info(
             f"Audiobook generated successfully in {output_format} format! You can now download it in the Download section. Click on the blue download link next to the file name. If you lost connection during generation, check the 'Past Generated Audiobooks' section.",
@@ -410,9 +329,17 @@ async def generate_audiobook_wrapper(
         ), None
         yield last_output, audiobook_path
         return
+    except asyncio.CancelledError:
+        # Handle task cancellation
+        update_task_status(task_id, "cancelled", "Task was cancelled by user")
+        unregister_running_task(task_id)
+        yield gr.Warning("Audiobook generation was cancelled."), None
+        yield None, None
+        return
     except Exception as e:
         # Mark task as failed
         update_task_status(task_id, "failed", "Generation failed", str(e))
+        unregister_running_task(task_id)
         print(e)
         traceback.print_exc()
         yield gr.Warning(f"Error generating audiobook: {str(e)}"), None
@@ -441,7 +368,7 @@ def clear_old_tasks(keep_recent_hours=24):
                 tasks_to_remove.append(task_id)
                 tasks_removed += 1
         except:
-            # Remove tasks with invalid timestamps
+            # Remove tasks with invalid timestamp
             tasks_to_remove.append(task_id)
             tasks_removed += 1
 
@@ -467,6 +394,41 @@ def clear_old_tasks_wrapper():
     except Exception as e:
         print(f"Error clearing old tasks: {e}")
         return gr.Warning(f"Error clearing old tasks: {str(e)}")
+
+
+def cancel_task_wrapper(task_id):
+    """Wrapper for cancelling a task with user feedback"""
+    if not task_id:
+        return gr.Warning("No task selected for cancellation.")
+
+    try:
+        success, message = cancel_task(task_id)
+        if success:
+            return gr.Info(f"Task cancelled: {message}", duration=5)
+        else:
+            return gr.Warning(f"Failed to cancel task: {message}")
+    except Exception as e:
+        print(f"Error cancelling task: {e}")
+        return gr.Warning(f"Error cancelling task: {str(e)}")
+
+
+def get_active_tasks_for_dropdown():
+    """Get active tasks formatted for dropdown selection"""
+    active_tasks = get_active_tasks()
+    if not active_tasks:
+        return gr.update(choices=[], value=None, visible=False), gr.update(
+            visible=False
+        )
+
+    choices = []
+    for task in active_tasks:
+        # Create a readable display name
+        display_name = f"{task['id']} - {task['status']} ({task['timestamp'][:16]})"
+        choices.append((display_name, task["id"]))
+
+    return gr.update(
+        choices=choices, value=choices[0][1] if choices else None, visible=True
+    ), gr.update(visible=True)
 
 
 with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
@@ -609,6 +571,17 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     "🧹 Clear Old Tasks", variant="secondary", size="sm"
                 )
 
+            # Task cancellation section
+            with gr.Group(visible=False) as cancel_task_group:
+                gr.Markdown("### ⏹️ Stop Running Task")
+                active_tasks_dropdown = gr.Dropdown(
+                    label="Select task to stop",
+                    choices=[],
+                    visible=False,
+                    interactive=True,
+                )
+                cancel_task_btn = gr.Button("⏹️ Stop Task", variant="stop", size="sm")
+
             past_files_display = gr.Markdown(
                 value="Click refresh to see generated audiobooks.", visible=True
             )
@@ -688,16 +661,28 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         lambda x: (
             refresh_past_files()
             if x is not None
-            else (gr.update(), gr.update(), gr.update())
+            else (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
         ),
         inputs=[audiobook_file],
-        outputs=[past_files_display, past_files_dropdown, delete_btn],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     )
 
     # Refresh past files when the refresh button is clicked
     refresh_btn.click(
         refresh_past_files,
-        outputs=[past_files_display, past_files_dropdown, delete_btn],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     )
 
     # Clear old tasks when the clear tasks button is clicked
@@ -707,7 +692,30 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     ).then(
         # Refresh the display after clearing tasks to update the active tasks section
         refresh_past_files,
-        outputs=[past_files_display, past_files_dropdown, delete_btn],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
+    )
+
+    # Cancel task when the cancel button is clicked
+    cancel_task_btn.click(
+        cancel_task_wrapper,
+        inputs=[active_tasks_dropdown],
+        outputs=[],
+    ).then(
+        # Refresh the display after cancelling task
+        refresh_past_files,
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     )
 
     # Update the download file when a past file is selected
@@ -734,7 +742,13 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     ).then(
         # Refresh the list after deletion
         refresh_past_files,
-        outputs=[past_files_display, past_files_dropdown, delete_btn],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     ).then(
         # Clear the download file after deletion
         lambda: gr.update(value=None, visible=False),
@@ -749,7 +763,13 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     # Load past files when the app starts
     gradio_app.load(
         refresh_past_files,
-        outputs=[past_files_display, past_files_dropdown, delete_btn],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     )
 
 app = gr.mount_gradio_app(app, gradio_app, path="/")  # Mount Gradio at root
