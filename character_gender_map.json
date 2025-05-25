@@ -20,13 +20,13 @@
         },
         "mia": {
             "name": "mia",
-            "age": "adult",
+            "age": "child",
             "gender": "female",
-            "gender_score": 7
+            "gender_score": 10
         },
         "sam": {
             "name": "sam",
-            "age": "adult",
+            "age": "child",
             "gender": "unknown",
             "gender_score": 5
         },
@@ -38,15 +38,15 @@
         },
         "jack": {
             "name": "jack",
-            "age": "adult",
+            "age": "child",
             "gender": "male",
-            "gender_score": 1
+            "gender_score": 4
         },
         "luna": {
             "name": "luna",
             "age": "adult",
             "gender": "female",
-            "gender_score": 8
+            "gender_score": 9
         }
     }
 }

@@ -266,7 +266,7 @@ def generate_chapters_file(
         output_file (str): The path to the output chapter metadata file. Defaults to "chapters.txt".
     """
     start_time = 0
-    with open(f"{TEMP_DIR}/{output_file}", "w", encoding="utf-8") as f:
+    with open(f"{TEMP_DIR}/{book_title}/{output_file}", "w", encoding="utf-8") as f:
         f.write(";FFMETADATA1\n")
         for chapter in chapter_files:
             duration = get_audio_duration_using_ffprobe(
@@ -492,6 +492,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
 
     output_m4b = f"generated_audiobooks/{safe_book_title}.m4b"
     cover_image = f"{TEMP_DIR}/{book_title}/cover.jpg"
+    chapters_file = f"{TEMP_DIR}/{book_title}/chapters.txt"
 
     # Construct metadata arguments safely
     metadata = (
@@ -506,7 +507,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
     )
 
     ffmpeg_cmd = (
-        f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i chapters.txt '
+        f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
         f'-c copy -map 0 -map 1 -disposition:v:0 attached_pic -map_metadata 2 {metadata} "{output_m4b}"'
     )
 

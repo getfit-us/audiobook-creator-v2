@@ -139,21 +139,12 @@ def concatenate_chapters(
     )
 
     for chapter_file in chapter_files:
-        # Force m4a extension for chapter files with Orpheus to avoid issues
-        if MODEL == "orpheus":
-            chapter_path = f"{chapter_file.split('.')[0]}.m4a"
-        else:
-            chapter_path = chapter_file
-        # Debugging
-        print(f"Chapter file: {chapter_file}")
-        print(f"Chapter path: {chapter_path}")
 
         # Create a temporary file list for this chapter's lines
         chapter_lines_list = os.path.join(
             f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
         )
-        # Debugging
-        print(f"Chapter lines list: {chapter_lines_list}")
+
         # Delete the chapter_lines_list file if it exists
         if os.path.exists(chapter_lines_list):
             os.remove(chapter_lines_list)
@@ -165,24 +156,18 @@ def concatenate_chapters(
                 )
                 # Use absolute path to prevent path duplication issues
                 f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
-                # Debugging
-                print(f"Added line {line_index} to chapter {chapter_file}")
-                print(f"Line audio path: {line_audio_path}")
-                print(f"Chapter path: {chapter_path}")
 
         # Use FFmpeg to concatenate the lines
         if MODEL == "orpheus":
             # For Orpheus, convert WAV segments to M4A chapters directly
             ffmpeg_cmd = (
                 f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_path}"'
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_file}"'
             )
         else:
             # For other models, we can use copy
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_path}"'
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_file}"'
 
-        # Print the command for debugging
-        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
         try:
             result = subprocess.run(
                 ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
@@ -197,7 +182,7 @@ def concatenate_chapters(
             raise e
 
         chapter_assembly_bar.update(1)
-        yield f"Assembled chapter: {chapter_file}"
+        print(f"Assembled chapter: {chapter_file}")
 
         # Clean up the temporary file list
         os.remove(chapter_lines_list)
@@ -501,8 +486,6 @@ async def generate_audio_with_single_voice(
                             abs_path = os.path.abspath(part_file)
                             f.write(f"file '{abs_path}'\n")
 
-                    # Debug: Show the contents of the parts list file
-                    print(f"\nContents of {parts_list_file}:")
                     with open(parts_list_file, "r") as f:
                         print(f.read())
 
@@ -698,6 +681,7 @@ async def generate_audio_with_single_voice(
 
     chapter_organization_bar.close()
     yield "Organizing audio by chapters complete"
+    input("Press Enter to continue...")
 
     concatenate_chapters(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
@@ -812,13 +796,12 @@ async def generate_audio_with_multiple_voices(
     narrator_voice = find_voice_for_gender_score(
         "narrator", character_gender_map, voice_map
     )
-    print(f"DEBUG: Narrator voice assigned: '{narrator_voice}'")
     yield "Loaded voice mappings and selected narrator voice"
 
     # Setup directories
     temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(os.path.join(TEMP_DIR, book_title))
+    empty_directory(temp_line_audio_dir)
 
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(temp_line_audio_dir, exist_ok=True)
@@ -859,12 +842,9 @@ async def generate_audio_with_multiple_voices(
                 return None
 
             speaker = doc["speaker"]
-            print(f"DEBUG: Processing line {line_index}, speaker: '{speaker}'")
+
             speaker_voice = find_voice_for_gender_score(
                 speaker, character_gender_map, voice_map
-            )
-            print(
-                f"DEBUG: Line {line_index}, speaker '{speaker}' assigned voice: '{speaker_voice}'"
             )
 
             annotated_parts = split_and_annotate_text(line)
@@ -1395,4 +1375,5 @@ async def test_single_voice():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # asyncio.run(main())
+    asyncio.run(test_single_voice())
