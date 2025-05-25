@@ -300,7 +300,7 @@ def save_book_wrapper(text_content, book_title):
         return gr.Warning("Please enter a book title before saving.")
 
     try:
-        save_book(text_content)
+        save_book(text_content, book_title)
         return gr.Info(
             "📖 Book saved successfully as 'converted_book.txt'!", duration=10
         )
