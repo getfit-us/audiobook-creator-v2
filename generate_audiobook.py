@@ -1351,28 +1351,6 @@ async def main(book_title="audiobook"):
     )
 
 
-async def test_single_voice():
-    """Wrapper function to test single voice generation"""
-    book_path = (
-        "sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub"
-    )
-
-    print("📖 Processing book and extracting text...")
-    # Consume the generator to actually execute the function
-    for output in process_book_and_extract_text(
-        book_path, "textract", "The Adventure of the Lost Treasure"
-    ):
-        pass
-    async for progress in generate_audio_with_single_voice(
-        "m4a",
-        "male",
-        True,
-        "converted_book.txt",
-        "The Adventure of the Lost Treasure",
-    ):
-        print(progress)
-
-
 if __name__ == "__main__":
-    # asyncio.run(main())
-    asyncio.run(test_single_voice())
+    asyncio.run(main())
+    # asyncio.run(test_single_voice())
