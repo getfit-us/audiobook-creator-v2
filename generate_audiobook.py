@@ -159,14 +159,14 @@ def concatenate_chapters(
 
         # Use FFmpeg to concatenate the lines
         if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly
+            # For Orpheus, convert WAV segments to M4A chapters directly with timestamp filtering
             ffmpeg_cmd = (
                 f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{TEMP_DIR}/{book_title}/{chapter_file}"'
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 -avoid_negative_ts make_zero -fflags +genpts "{TEMP_DIR}/{book_title}/{chapter_file}"'
             )
         else:
-            # For other models, we can use copy
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c copy "{TEMP_DIR}/{book_title}/{chapter_file}"'
+            # For other models, use re-encoding with timestamp filtering to prevent truncation
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts "{TEMP_DIR}/{book_title}/{chapter_file}"'
 
         try:
             result = subprocess.run(
@@ -681,7 +681,6 @@ async def generate_audio_with_single_voice(
 
     chapter_organization_bar.close()
     yield "Organizing audio by chapters complete"
-    input("Press Enter to continue...")
 
     concatenate_chapters(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir

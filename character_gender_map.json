@@ -26,27 +26,27 @@
         },
         "sam": {
             "name": "sam",
-            "age": "child",
-            "gender": "unknown",
-            "gender_score": 5
+            "age": "adult",
+            "gender": "male",
+            "gender_score": 1
         },
         "ellie": {
             "name": "ellie",
-            "age": "adult",
+            "age": "child",
             "gender": "female",
-            "gender_score": 9
+            "gender_score": 10
         },
         "jack": {
             "name": "jack",
-            "age": "child",
+            "age": "adult",
             "gender": "male",
-            "gender_score": 4
+            "gender_score": 2
         },
         "luna": {
             "name": "luna",
-            "age": "adult",
+            "age": "child",
             "gender": "female",
-            "gender_score": 9
+            "gender_score": 10
         }
     }
 }

@@ -508,7 +508,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
 
     ffmpeg_cmd = (
         f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
-        f'-c copy -map 0 -map 1 -disposition:v:0 attached_pic -map_metadata 2 {metadata} "{output_m4b}"'
+        f'-c:a aac -b:a 256k -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 -avoid_negative_ts make_zero -fflags +genpts {metadata} "{output_m4b}"'
     )
 
     subprocess.run(ffmpeg_cmd, shell=True, check=True)
@@ -518,12 +518,47 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
 def add_silence_to_audio_file_by_appending_pre_generated_silence(
     temp_dir, input_file_name, format
 ):
-    silence_path = "static_files/silence.aac"
+    """
+    Adds silence to the end of an audio file using FFmpeg (safer than binary append).
+    """
+    input_path = f"{temp_dir}/{input_file_name}"
+    temp_output_path = f"{temp_dir}/temp_with_silence_{input_file_name}"
 
-    with open(silence_path, "rb") as silence_file, open(
-        f"{temp_dir}/{input_file_name}", "ab"
-    ) as audio_file:
-        audio_file.write(silence_file.read())
+    # Use FFmpeg to properly add silence without corrupting the file
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_path,
+        "-i",
+        "static_files/silence.aac",
+        "-filter_complex",
+        "[0:a][1:a]concat=n=2:v=0:a=1[out]",
+        "-map",
+        "[out]",
+        "-c:a",
+        "aac",  # Ensure consistent encoding
+        temp_output_path,
+    ]
+
+    try:
+        result = subprocess.run(ffmpeg_cmd, check=True, capture_output=True, text=True)
+
+        # Replace original file with the new one
+        if os.path.exists(temp_output_path):
+            os.replace(temp_output_path, input_path)
+        else:
+            print(f"Warning: FFmpeg silence addition failed for {input_file_name}")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: FFmpeg failed to add silence to {input_file_name}: {e}")
+        print(f"FFmpeg stderr: {e.stderr}")
+        # Fallback to original method if FFmpeg fails, but this is risky
+        silence_path = "static_files/silence.aac"
+        with open(silence_path, "rb") as silence_file, open(
+            input_path, "ab"
+        ) as audio_file:
+            audio_file.write(silence_file.read())
 
 
 def add_silence_to_audio_file_by_reencoding_using_ffmpeg(
@@ -580,10 +615,9 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
     # Construct the output file path
     output_file = f"generated_audiobooks/{safe_book_title}.m4a"
 
-    # Construct the ffmpeg command
-    ffmpeg_cmd = (
-        f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c copy "{output_file}"'
-    )
+    # Use re-encoding instead of copy to prevent truncation issues
+    # that can occur at file boundaries, especially at the end
+    ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts "{output_file}"'
 
     # Run the ffmpeg command
     subprocess.run(ffmpeg_cmd, shell=True, check=True)
