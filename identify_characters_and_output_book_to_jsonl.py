@@ -28,6 +28,7 @@ from tqdm import tqdm
 import torch
 from gliner import GLiNER
 import warnings
+from config.constants import TEMP_DIR
 from utils.file_utils import write_jsons_to_jsonl_file, empty_file, write_json_to_file
 from utils.find_book_protagonist import find_book_protagonist
 from utils.llm_utils import check_if_have_to_include_no_think_token, check_if_llm_is_up
@@ -401,15 +402,15 @@ async def identify_characters_and_output_book_to_jsonl(text: str, protagonist):
 
     yield "Character Identification Completed. You can now move onto the next step (Audiobook generation)."
 
-async def process_book_and_identify_characters(book_name):
+async def process_book_and_identify_characters(book_title):
     is_llm_up, message = await check_if_llm_is_up(async_openai_client, model_name)
 
     if not is_llm_up:
         raise Exception(message)
 
     yield "Finding protagonist. Please wait..."
-    protagonist = await find_book_protagonist(book_name, async_openai_client, model_name)
-    f = open("converted_book.txt", "r", encoding='utf-8')
+    protagonist = await find_book_protagonist(book_title, async_openai_client, model_name)
+    f = open(f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding='utf-8')
     book_text = f.read()
     yield f"Found protagonist: {protagonist}"
     await asyncio.sleep(1)
@@ -417,8 +418,8 @@ async def process_book_and_identify_characters(book_name):
     async for update in identify_characters_and_output_book_to_jsonl(book_text, protagonist):
         yield update
 
-async def main():
-    f = open("converted_book.txt", "r", encoding='utf-8')
+async def main(book_title: str):
+    f = open(f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding='utf-8')
     book_text = f.read()
 
     # Ask for the protagonist's name

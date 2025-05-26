@@ -17,7 +17,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
 import shutil
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
 from tqdm import tqdm
 import json
 import os
@@ -26,6 +26,13 @@ import re
 from word2number import w2n
 import time
 import sys
+from config.constants import (
+    API_KEY,
+    BASE_URL,
+    MODEL,
+    MAX_PARALLEL_REQUESTS_BATCH_SIZE,
+    TEMP_DIR,
+)
 from utils.check_tts_api import check_tts_api
 from utils.run_shell_commands import (
     check_if_ffmpeg_is_installed,
@@ -35,34 +42,25 @@ from utils.file_utils import read_json, empty_directory
 from utils.audiobook_utils import (
     merge_chapters_to_m4b,
     convert_audio_file_formats,
-    add_silence_to_audio_file_by_reencoding_using_ffmpeg,
     merge_chapters_to_standard_audio_file,
     add_silence_to_audio_file_by_appending_pre_generated_silence,
 )
 from utils.check_tts_api import check_tts_api
 from dotenv import load_dotenv
 import subprocess
+import random
+from utils.task_utils import update_task_status, is_task_cancelled
 
 load_dotenv()
 
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8880/v1")
-API_KEY = os.environ.get("API_KEY", "not-needed")
-MODEL = os.environ.get("MODEL", "kokoro")
-MAX_PARALLEL_REQUESTS_BATCH_SIZE = int(
-    os.environ.get("MAX_PARALLEL_REQUESTS_BATCH_SIZE", 2)
-)
-VOICE_MAP = (
-    read_json("static_files/kokoro_voice_map_male_narrator.json")
-    if MODEL == "kokoro"
-    else read_json("static_files/orpheus_voice_map_male_narrator.json")
-)
 
-# When using Orpheus, we need to use WAV for line segments but M4A for final chapters to avoid format issues
-FORMAT = "wav" if MODEL == "orpheus" else "aac"
-CHAPTER_FORMAT = "m4a" if MODEL == "orpheus" else FORMAT
+API_OUTPUT_FORMAT = "wav" if MODEL == "orpheus" else "aac"
+
 os.makedirs("audio_samples", exist_ok=True)
 
 async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+print(BASE_URL)
 
 
 def sanitize_filename(text):
@@ -132,6 +130,142 @@ def check_if_chapter_heading(text):
     return False  # No match
 
 
+def concatenate_chapters(
+    chapter_files, book_title, chapter_line_map, temp_line_audio_dir
+):
+    """
+    Concatenates the chapters into a single audiobook file.
+    """
+    # Third pass: Concatenate audio files for each chapter in order
+    chapter_assembly_bar = tqdm(
+        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    )
+
+    def assemble_single_chapter(chapter_file):
+        # Create a temporary file list for this chapter's lines
+        chapter_lines_list = os.path.join(
+            f"{TEMP_DIR}/{book_title}",
+            f"chapter_lines_list_{chapter_file.replace('/', '_').replace('.', '_')}.txt",
+        )
+
+        # Delete the chapter_lines_list file if it exists
+        if os.path.exists(chapter_lines_list):
+            os.remove(chapter_lines_list)
+
+        with open(chapter_lines_list, "w", encoding="utf-8") as f:
+            for line_index in sorted(chapter_line_map[chapter_file]):
+                line_audio_path = os.path.join(
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
+                )
+                # Use absolute path to prevent path duplication issues
+                f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
+
+        # Use FFmpeg to concatenate the lines with optimized parameters
+        if MODEL == "orpheus":
+            # For Orpheus, convert WAV segments to M4A chapters directly with timestamp filtering
+            ffmpeg_cmd = (
+                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
+            )
+        else:
+            # For other models, use re-encoding with timestamp filtering to prevent truncation
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
+
+        try:
+            result = subprocess.run(
+                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
+            )
+            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
+            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
+        except subprocess.CalledProcessError as e:
+            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
+            print(f"[ERROR] Command: {ffmpeg_cmd}")
+            print(f"[ERROR] Stdout: {e.stdout}")
+            print(f"[ERROR] Stderr: {e.stderr}")
+            raise e
+
+        print(f"Assembled chapter: {chapter_file}")
+
+        # Clean up the temporary file list
+        os.remove(chapter_lines_list)
+        return chapter_file
+
+    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
+    import concurrent.futures
+
+    max_workers = min(4, len(chapter_files))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(assemble_single_chapter, chapter_file)
+            for chapter_file in chapter_files
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                chapter_file = future.result()
+                chapter_assembly_bar.update(1)
+            except Exception as e:
+                print(f"Error assembling chapter: {e}")
+                raise e
+
+    chapter_assembly_bar.close()
+
+
+async def parallel_post_processing(chapter_files, book_title, output_format):
+    """
+    Parallel post-processing of chapter files to add silence and convert formats.
+    """
+
+    def process_single_chapter(chapter_file):
+        # Add silence to chapter file
+        add_silence_to_audio_file_by_appending_pre_generated_silence(
+            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
+        )
+
+        # Convert to M4A format if needed
+        chapter_name = chapter_file.split(f".{output_format}")[0]
+        m4a_chapter_file = f"{chapter_name}.m4a"
+
+        # Only convert if not already in M4A format
+        if not chapter_file.endswith(".m4a"):
+            convert_audio_file_formats(
+                output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
+            )
+
+        return m4a_chapter_file
+
+    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
+    import concurrent.futures
+
+    max_workers = min(4, len(chapter_files))
+    m4a_chapter_files = []
+
+    post_processing_bar = tqdm(
+        total=len(chapter_files), unit="chapter", desc="Post Processing (Parallel)"
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_chapter, chapter_file)
+            for chapter_file in chapter_files
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                m4a_chapter_file = future.result()
+                m4a_chapter_files.append(m4a_chapter_file)
+                post_processing_bar.update(1)
+            except Exception as e:
+                print(f"Error in post-processing: {e}")
+                raise e
+
+    post_processing_bar.close()
+
+    # Sort to maintain chapter order
+    m4a_chapter_files.sort()
+    return m4a_chapter_files
+
+
 def find_voice_for_gender_score(character: str, character_gender_map, voice_map):
     """
     Finds the appropriate voice for a character based on their gender score.
@@ -149,15 +283,231 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
         str: The voice identifier that matches the character's gender score.
     """
 
-    # Get the character's gender score
-    character_gender_score_doc = character_gender_map["scores"][character.lower()]
-    character_gender_score = character_gender_score_doc["gender_score"]
+    try:
+        # Get the character's gender score
+        character_lower = character.lower()
 
-    # Iterate over the voice identifiers and their scores
-    for voice, score in voice_map.items():
-        # Find the voice identifier that matches the character's gender score
-        if score == character_gender_score:
-            return voice
+        # Check if character exists in the character_gender_map
+        if character_lower not in character_gender_map["scores"]:
+            print(
+                f"WARNING: Character '{character}' not found in character_gender_map. Using narrator voice as fallback."
+            )
+            # Use narrator's voice as fallback
+            if "narrator" in character_gender_map["scores"]:
+                character_gender_score_doc = character_gender_map["scores"]["narrator"]
+                character_gender_score = character_gender_score_doc["gender_score"]
+            else:
+                print(
+                    f"ERROR: Even narrator not found in character_gender_map. Using score 5 (neutral)."
+                )
+                character_gender_score = 5
+        else:
+            character_gender_score_doc = character_gender_map["scores"][character_lower]
+            character_gender_score = character_gender_score_doc["gender_score"]
+
+        # Iterate over the voice identifiers and their scores
+        for voice, score in voice_map.items():
+            # Find the voice identifier that matches the character's gender score
+            if score == character_gender_score:
+                return voice
+
+        # If no exact match found, find the closest gender score
+        print(
+            f"WARNING: No exact voice match for character '{character}' with gender score {character_gender_score}. Finding closest match."
+        )
+
+        closest_voice = None
+        closest_diff = float("inf")
+
+        for voice, score in voice_map.items():
+            diff = abs(score - character_gender_score)
+            if diff < closest_diff:
+                closest_diff = diff
+                closest_voice = voice
+
+        if closest_voice:
+            print(
+                f"Using voice '{closest_voice}' (score {voice_map[closest_voice]}) for character '{character}' (score {character_gender_score})"
+            )
+            return closest_voice
+
+        # Final fallback: use the first available voice
+        if voice_map:
+            fallback_voice = list(voice_map.keys())[0]
+            print(
+                f"ERROR: Could not find suitable voice for character '{character}'. Using fallback voice '{fallback_voice}'."
+            )
+            return fallback_voice
+
+        # Absolute fallback for empty voice_map
+        print(f"CRITICAL ERROR: voice_map is empty. Using hardcoded fallback voice.")
+        return "af_heart"  # Default fallback voice
+
+    except Exception as e:
+        print(f"ERROR in find_voice_for_gender_score for character '{character}': {e}")
+        print("Using hardcoded fallback voice.")
+        return "af_heart"  # Default fallback voice
+
+
+def preprocess_text_for_orpheus(text):
+    """
+    Preprocess text for Orpheus TTS to prevent repetition issues.
+    Adds full stops where necessary while handling edge cases.
+    """
+    if not text or len(text.strip()) == 0:
+        return text
+
+    text = text.strip()
+
+    # Don't modify very short text (single words or very short phrases)
+    if len(text) <= 3:
+        return text
+
+    # Check if text already ends with proper punctuation
+    punctuation_marks = {".", "!", "?", ":", ";", ",", '"', "'", ")", "]", "}"}
+    if text[-1] in punctuation_marks:
+        return text
+
+    # Handle dialogue - don't add period inside quotes
+    if text.startswith('"') and text.endswith('"'):
+        # For dialogue, check if there's already punctuation before the closing quote
+        if len(text) > 2 and text[-2] in {".", "!", "?", ",", ";", ":"}:
+            return text
+        else:
+            # Add period before closing quote
+            return text[:-1] + '."'
+
+    # Handle text that ends with quotes but doesn't start with them
+    if text.endswith('"') and not text.startswith('"'):
+        # Check if there's punctuation before the quote
+        if len(text) > 1 and text[-2] in {".", "!", "?", ",", ";", ":"}:
+            return text
+        else:
+            # Add period before the quote
+            return text[:-1] + '."'
+
+    # For regular narration text, add a period
+    return text + "."
+
+
+async def generate_tts_with_retry(
+    client, model, voice, text, response_format, speed=0.85, max_retries=5, task_id=None
+):
+    """
+    Generate TTS audio with retry logic and exponential backoff.
+
+    Args:
+        client: AsyncOpenAI client
+        model: TTS model to use
+        voice: Voice to use
+        text: Text to convert to speech
+        response_format: Audio format (wav, aac, etc.)
+        speed: Speech speed
+        max_retries: Maximum number of retry attempts
+        task_id: Task ID for cancellation checking
+
+    Returns:
+        bytearray: Audio data buffer
+
+    Raises:
+        Exception: If all retries are exhausted or task is cancelled
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            # Check if task has been cancelled before each attempt
+            if task_id and is_task_cancelled(task_id):
+                raise asyncio.CancelledError("Task was cancelled by user")
+
+            audio_buffer = bytearray()
+
+            async with client.audio.speech.with_streaming_response.create(
+                model=model,
+                voice=voice,
+                response_format=response_format,
+                speed=speed,
+                input=text,
+            ) as response:
+                if response.status_code != 200:
+                    error_msg = f"TTS API returned status {response.status_code}"
+                    try:
+                        error_content = await response.aread()
+                        error_msg += f": {error_content.decode()}"
+                    except Exception:
+                        pass
+
+                    if attempt < max_retries:
+                        print(
+                            f"Attempt {attempt + 1} failed with status {response.status_code}, retrying..."
+                        )
+                        continue
+                    else:
+                        raise Exception(error_msg)
+
+                async for chunk in response.iter_bytes():
+                    # Check for cancellation during streaming
+                    if task_id and is_task_cancelled(task_id):
+                        raise asyncio.CancelledError("Task was cancelled by user")
+                    audio_buffer.extend(chunk)
+
+            if len(audio_buffer) > 0:
+                return audio_buffer
+            else:
+                if attempt < max_retries:
+                    print(f"Attempt {attempt + 1} returned 0 bytes, retrying...")
+                    continue
+                else:
+                    raise Exception("TTS returned 0 bytes after all retries")
+
+        except asyncio.CancelledError:
+            # Don't retry on cancellation
+            raise
+        except Exception as e:
+            error_msg = str(e)
+
+            # Check if this is a retryable error
+            retryable_errors = [
+                "peer closed connection",
+                "connection reset",
+                "timeout",
+                "network",
+                "temporary failure",
+                "service unavailable",
+                "bad gateway",
+                "gateway timeout",
+                "connection aborted",
+                "connection refused",
+                "connection error",
+                "read timeout",
+                "write timeout",
+                "incomplete read",
+                "broken pipe",
+                "socket error",
+                "http error 5",  # 5xx server errors
+                "internal server error",
+                "server error",
+            ]
+
+            is_retryable = any(
+                error_phrase in error_msg.lower() for error_phrase in retryable_errors
+            )
+
+            if attempt < max_retries and is_retryable:
+                # Exponential backoff with jitter
+                delay = (2**attempt) + random.uniform(0, 1)
+                print(f"Attempt {attempt + 1} failed with retryable error: {error_msg}")
+                print(f"Retrying in {delay:.2f} seconds...")
+                await asyncio.sleep(delay)
+                continue
+            else:
+                # Either max retries reached or non-retryable error
+                if attempt >= max_retries:
+                    print(f"All {max_retries + 1} attempts failed for TTS generation")
+                else:
+                    print(f"Non-retryable error: {error_msg}")
+                raise e
+
+    # This should never be reached, but just in case
+    raise Exception("Unexpected end of retry loop")
 
 
 async def generate_audio_with_single_voice(
@@ -166,6 +516,7 @@ async def generate_audio_with_single_voice(
     generate_m4b_audiobook_file=False,
     book_path="",
     book_title="audiobook",
+    task_id=None,
 ):
     # Read the text from the file
     """
@@ -187,10 +538,11 @@ async def generate_audio_with_single_voice(
              organizing by chapters, assembling chapters, and post-processing steps.
     """
 
-    with open("converted_book.txt", "r", encoding="utf-8") as f:
+    with open(
+        f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding="utf-8"
+    ) as f:
         text = f.read()
     lines = text.split("\n")
-
     # Filter out empty lines
     lines = [line.strip() for line in lines if line.strip()]
 
@@ -214,23 +566,24 @@ async def generate_audio_with_single_voice(
             dialogue_voice = "leah"
 
     # Setup directories
-    temp_audio_dir = "temp_audio"
-    temp_line_audio_dir = os.path.join(temp_audio_dir, "line_segments")
+    temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(temp_audio_dir)
+    empty_directory(os.path.join(temp_line_audio_dir, book_title))
 
-    os.makedirs(temp_audio_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(temp_line_audio_dir, exist_ok=True)
 
     # Batch processing parameters
-    semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS_BATCH_SIZE)
+    semaphore = asyncio.Semaphore(10)
+    print(f"MAX_PARALLEL_REQUESTS_BATCH_SIZE: {MAX_PARALLEL_REQUESTS_BATCH_SIZE}")
 
     # Initial setup for chapters
     chapter_index = 1
+
     if MODEL == "orpheus":
         current_chapter_audio = "Introduction.m4a"
     else:
-        current_chapter_audio = f"Introduction.{CHAPTER_FORMAT}"
+        current_chapter_audio = f"Introduction.{output_format}"
     chapter_files = []
 
     # First pass: Generate audio for each line independently
@@ -250,42 +603,49 @@ async def generate_audio_with_single_voice(
             if not line:
                 return None
 
+            # Check if task has been cancelled before processing this line
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Task {task_id} cancelled before processing line {line_index}"
+                )
+                raise asyncio.CancelledError("Task was cancelled by user")
+
             annotated_parts = split_and_annotate_text(line)
             part_files = []  # Store temporary files for each part
 
             for i, part in enumerate(annotated_parts):
                 text_to_speak = part["text"]
+                # Check if task has been cancelled
+                if task_id and is_task_cancelled(task_id):
+                    print(f"[DEBUG] Task {task_id} cancelled during line processing")
+                    raise asyncio.CancelledError("Task was cancelled by user")
+
+                # Preprocess text for Orpheus to prevent repetition issues
+                if MODEL == "orpheus":
+                    text_to_speak = preprocess_text_for_orpheus(text_to_speak)
+
                 voice_to_speak_in = (
                     narrator_voice if part["type"] == "narration" else dialogue_voice
                 )
 
                 # Create temporary file for this part
                 part_file_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}_part_{i}.{FORMAT}"
+                    temp_line_audio_dir,
+                    f"line_{line_index:06d}_part_{i}.{API_OUTPUT_FORMAT}",
                 )
 
-                current_part_audio_buffer = bytearray()
                 try:
-                    async with async_openai_client.audio.speech.with_streaming_response.create(
-                        model=MODEL,
-                        voice=voice_to_speak_in,
-                        response_format=FORMAT,
+                    # Use retry mechanism for TTS generation
+                    current_part_audio_buffer = await generate_tts_with_retry(
+                        async_openai_client,
+                        MODEL,
+                        voice_to_speak_in,
+                        text_to_speak,
+                        API_OUTPUT_FORMAT,
                         speed=0.85,
-                        input=text_to_speak,
-                    ) as response:
-                        if response.status_code != 200:
-                            print(
-                                f"ERROR: TTS API returned status {response.status_code} for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak}'"
-                            )
-                            try:
-                                error_content = await response.aread()
-                                print(f"ERROR CONTENT: {error_content.decode()}")
-                            except Exception as e_read:
-                                print(f"ERROR: Could not read error content: {e_read}")
-                            continue  # Skip to the next part
-
-                        async for chunk in response.iter_bytes():
-                            current_part_audio_buffer.extend(chunk)
+                        max_retries=5,
+                        task_id=task_id,
+                    )
 
                     # Save this part to a temporary file
                     if len(current_part_audio_buffer) > 0:
@@ -294,19 +654,24 @@ async def generate_audio_with_single_voice(
                         part_files.append(part_file_path)
                     else:
                         print(
-                            f"WARNING: TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...' returned 0 bytes despite 200 OK."
+                            f"WARNING: TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...' returned 0 bytes after retries."
                         )
 
+                except asyncio.CancelledError:
+                    # Re-raise cancellation errors
+                    raise
                 except Exception as e:
                     print(
-                        f"ERROR processing TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...': {e}"
+                        f"CRITICAL ERROR: TTS failed after all retries for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...': {e}"
                     )
-                    continue  # Skip to the next part
+                    # This is now a critical error since we've exhausted retries
+                    # We should not continue as this will result in missing audio
+                    raise e
 
             # Concatenate all parts using FFmpeg
             if part_files:
                 final_line_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
 
                 if len(part_files) == 1:
@@ -324,60 +689,9 @@ async def generate_audio_with_single_voice(
                             abs_path = os.path.abspath(part_file)
                             f.write(f"file '{abs_path}'\n")
 
-                    # Debug: Show the contents of the parts list file
-                    print(f"\nContents of {parts_list_file}:")
                     with open(parts_list_file, "r") as f:
                         print(f.read())
 
-                    # Use FFmpeg filter_complex concat for more reliable concatenation
-                    input_args = ""
-                    filter_complex = ""
-
-                    for i, part_file in enumerate(part_files):
-                        input_args += f" -i '{part_file}'"
-
-                    # Build concat filter - more reliable than demuxer
-                    filter_inputs = "".join(
-                        [f"[{i}:a]" for i in range(len(part_files))]
-                    )
-                    filter_complex = (
-                        f"{filter_inputs}concat=n={len(part_files)}:v=0:a=1[outa]"
-                    )
-
-                    ffmpeg_cmd = f'ffmpeg -y{input_args} -filter_complex "{filter_complex}" -map "[outa]" -c:a aac -b:a 256k \'{final_line_path}\''
-
-                    # Debug: Print info about the parts before concatenation
-                    print(
-                        f"\n=== DEBUG: Line {line_index} has {len(part_files)} parts ==="
-                    )
-                    print(f"Line text: '{line[:100]}...'")
-                    for i, part_file in enumerate(part_files):
-                        part_info = annotated_parts[i]
-                        print(
-                            f"Part {i}: {part_info['type']} - '{part_info['text'][:50]}...'"
-                        )
-                        print(f"  File: {part_file}")
-                        voice_type = (
-                            "narrator"
-                            if part_info["type"] == "narration"
-                            else "dialogue"
-                        )
-                        print(f"  Voice: {voice_type}")
-
-                        # Check if file exists and get size
-                        if os.path.exists(part_file):
-                            file_size = os.path.getsize(part_file)
-                            print(f"  File size: {file_size} bytes")
-                        else:
-                            print(f"  ERROR: File does not exist!")
-
-                    print(f"FFmpeg command: {ffmpeg_cmd}")
-                    print(
-                        f"Proceeding with concatenation of {len(part_files)} parts..."
-                    )
-
-                    # Step 1: Normalize all parts to ensure compatibility
-                    print(f"Normalizing {len(part_files)} parts for concatenation...")
                     normalized_parts = []
 
                     for i, part_file in enumerate(part_files):
@@ -434,7 +748,7 @@ async def generate_audio_with_single_voice(
                                 f.write(f"file '{os.path.abspath(norm_file)}'\n")
 
                         # Final concatenation to target format
-                        if FORMAT == "wav":
+                        if API_OUTPUT_FORMAT == "wav":
                             concat_cmd = [
                                 "ffmpeg",
                                 "-y",
@@ -498,6 +812,12 @@ async def generate_audio_with_single_voice(
 
             progress_bar.update(1)
             progress_counter += 1
+            # update the task status
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {progress_counter}/{total_size}",
+            )
 
             return {
                 "index": line_index,
@@ -516,6 +836,27 @@ async def generate_audio_with_single_voice(
     # Initialize results_all list
     results_all = [None] * len(lines)
 
+    # Create a cancellation monitor task
+    async def cancellation_monitor():
+        while tasks:
+            await asyncio.sleep(0.5)  # Check every 500ms
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Cancellation monitor detected task {task_id} is cancelled"
+                )
+                # Cancel all remaining tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(f"[DEBUG] Cancellation monitor cancelled a task")
+                # clean up the temp directory
+                shutil.rmtree(f"{TEMP_DIR}/{book_title}")
+                os.rmdir(f"{TEMP_DIR}/{book_title}")
+                break
+
+    # Start the cancellation monitor
+    monitor_task = asyncio.create_task(cancellation_monitor())
+
     # Process tasks with progress updates
     last_reported = -1
     while tasks:
@@ -532,14 +873,36 @@ async def generate_audio_with_single_voice(
         if progress_counter > last_reported:
             last_reported = progress_counter
             percent = (progress_counter / total_size) * 100
+
+            # Check if task has been cancelled
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Task {task_id} was cancelled, cancelling all pending tasks"
+                )
+                # Cancel all pending tasks immediately
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(f"[DEBUG] Cancelled pending task")
+                raise asyncio.CancelledError("Task was cancelled by user")
+
+            # update the task status
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {percent:.1f}%",
+            )
             yield f"Generating audiobook. Progress: {percent:.1f}%"
 
     # All tasks have completed at this point and results_all is populated
     results = [r for r in results_all if r is not None]  # Filter out empty lines
 
+    # Clean up the monitor task
+    if not monitor_task.done():
+        monitor_task.cancel()
+
     progress_bar.close()
 
-    # Filter out empty lines (same as in your original code)
     results = [r for r in results_all if r is not None]
 
     yield "Completed generating audio for all lines"
@@ -553,11 +916,12 @@ async def generate_audio_with_single_voice(
         # Check if this is a chapter heading
         if result["is_chapter_heading"]:
             chapter_index += 1
+
             if MODEL == "orpheus":
                 current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
             else:
                 current_chapter_audio = (
-                    f"{sanitize_filename(result['line'])}.{CHAPTER_FORMAT}"
+                    f"{sanitize_filename(result['line'])}.{output_format}"
                 )
 
         if current_chapter_audio not in chapter_files:
@@ -571,91 +935,16 @@ async def generate_audio_with_single_voice(
     chapter_organization_bar.close()
     yield "Organizing audio by chapters complete"
 
-    # Third pass: Concatenate audio files for each chapter in order
-    chapter_assembly_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    concatenate_chapters(
+        chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
 
-    for chapter_file in chapter_files:
-        # Force m4a extension for chapter files with Orpheus to avoid issues
-        if MODEL == "orpheus":
-            chapter_path = os.path.join(
-                temp_audio_dir, f"{chapter_file.split('.')[0]}.m4a"
-            )
-        else:
-            chapter_path = os.path.join(temp_audio_dir, chapter_file)
-
-        # Create a temporary file list for this chapter's lines
-        chapter_lines_list = "chapter_lines_list.txt"
-        with open(chapter_lines_list, "w", encoding="utf-8") as f:
-            for line_index in sorted(chapter_line_map[chapter_file]):
-                line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
-                )
-                f.write(f"file '{line_audio_path}'\n")
-
-        # Use FFmpeg to concatenate the lines
-        if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly
-            ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
-            )
-        else:
-            # For other models, we need to re-encode to ensure proper AAC format
-            ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
-            )
-
-        # Print the command for debugging
-        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
-        try:
-            result = subprocess.run(
-                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
-            )
-            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
-            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
-            print(f"[ERROR] Command: {ffmpeg_cmd}")
-            print(f"[ERROR] Stdout: {e.stdout}")
-            print(f"[ERROR] Stderr: {e.stderr}")
-            raise e
-
-        chapter_assembly_bar.update(1)
-        yield f"Assembled chapter: {chapter_file}"
-
-        # Clean up the temporary file list
-        os.remove(chapter_lines_list)
-
-    chapter_assembly_bar.close()
-
-    # Post-processing steps
-    post_processing_bar = tqdm(
-        total=len(chapter_files) * 2, unit="task", desc="Post Processing"
+    # Optimized parallel post-processing
+    yield "Starting parallel post-processing..."
+    m4a_chapter_files = await parallel_post_processing(
+        chapter_files, book_title, output_format
     )
-
-    # Add silence to each chapter file
-    for chapter in chapter_files:
-        add_silence_to_audio_file_by_appending_pre_generated_silence(
-            temp_audio_dir, chapter, CHAPTER_FORMAT
-        )
-        post_processing_bar.update(1)
-        yield f"Added silence to chapter: {chapter}"
-
-    m4a_chapter_files = []
-
-    # Convert all chapter files to M4A format
-    for chapter in chapter_files:
-        chapter_name = chapter.split(f".{CHAPTER_FORMAT}")[0]
-        m4a_chapter_files.append(f"{chapter_name}.m4a")
-        # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(CHAPTER_FORMAT, "m4a", temp_audio_dir, chapter_name)
-        post_processing_bar.update(1)
-        yield f"Converted chapter to M4A: {chapter_name}"
-
-    post_processing_bar.close()
+    yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
 
     # Clean up temp line audio files
     shutil.rmtree(temp_line_audio_dir)
@@ -664,17 +953,17 @@ async def generate_audio_with_single_voice(
     if generate_m4b_audiobook_file:
         # Merge all chapter files into a final m4b audiobook
         yield "Creating M4B audiobook file..."
-        merge_chapters_to_m4b(book_path, m4a_chapter_files)
+        merge_chapters_to_m4b(book_path, m4a_chapter_files, book_title)
+        # clean the temp directory
+        shutil.rmtree(f"{TEMP_DIR}/{book_title}")
         yield "M4B audiobook created successfully"
     else:
         # Merge all chapter files into a standard M4A audiobook
         yield "Creating final audiobook..."
-        merge_chapters_to_standard_audio_file(m4a_chapter_files)
-        # When using Orpheus, we've already generated m4a files
-        source_format = "m4a" if MODEL == "orpheus" else FORMAT
+        merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
         safe_book_title = sanitize_book_title_for_filename(book_title)
         convert_audio_file_formats(
-            source_format, output_format, "generated_audiobooks", safe_book_title
+            API_OUTPUT_FORMAT, output_format, "generated_audiobooks", safe_book_title
         )
         yield f"Audiobook in {output_format} format created successfully"
 
@@ -685,6 +974,7 @@ async def generate_audio_with_multiple_voices(
     generate_m4b_audiobook_file=False,
     book_path="",
     book_title="audiobook",
+    task_id=None,
 ):
     # Path to the JSONL file containing speaker-attributed lines
     """
@@ -709,7 +999,6 @@ async def generate_audio_with_multiple_voices(
     """
     file_path = "speaker_attributed_book.jsonl"
     json_data_array = []
-
     # Open the JSONL file and read it line by line
     with open(file_path, "r", encoding="utf-8") as file:
         for line in file:
@@ -741,24 +1030,23 @@ async def generate_audio_with_multiple_voices(
     yield "Loaded voice mappings and selected narrator voice"
 
     # Setup directories
-    temp_audio_dir = "temp_audio"
-    temp_line_audio_dir = os.path.join(temp_audio_dir, "line_segments")
+    temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(temp_audio_dir)
+    empty_directory(temp_line_audio_dir)
 
-    os.makedirs(temp_audio_dir, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(temp_line_audio_dir, exist_ok=True)
     yield "Set up temporary directories for audio processing"
 
     # Batch processing parameters
-    semaphore = asyncio.Semaphore(4)
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS_BATCH_SIZE)
 
     # Initial setup for chapters
     chapter_index = 1
     if MODEL == "orpheus":
         current_chapter_audio = "Introduction.m4a"
     else:
-        current_chapter_audio = f"Introduction.{CHAPTER_FORMAT}"
+        current_chapter_audio = f"Introduction.{output_format}"
     chapter_files = []
 
     # First pass: Generate audio for each line independently
@@ -784,7 +1072,15 @@ async def generate_audio_with_multiple_voices(
                 progress_bar.update(1)  # Update the progress bar even for empty lines
                 return None
 
+            # Check if task has been cancelled before processing this line
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Multi-voice task {task_id} cancelled before processing line {line_index}"
+                )
+                raise asyncio.CancelledError("Task was cancelled by user")
+
             speaker = doc["speaker"]
+
             speaker_voice = find_voice_for_gender_score(
                 speaker, character_gender_map, voice_map
             )
@@ -794,43 +1090,40 @@ async def generate_audio_with_multiple_voices(
 
             for i, part in enumerate(annotated_parts):
                 text_to_speak = part["text"]
+
+                # Check if task has been cancelled during part processing
+                if task_id and is_task_cancelled(task_id):
+                    print(
+                        f"[DEBUG] Multi-voice task {task_id} cancelled during part processing"
+                    )
+                    raise asyncio.CancelledError("Task was cancelled by user")
+
+                # Preprocess text for Orpheus to prevent repetition issues
+                if MODEL == "orpheus":
+                    text_to_speak = preprocess_text_for_orpheus(text_to_speak)
+
                 voice_to_speak_in = (
                     narrator_voice if part["type"] == "narration" else speaker_voice
                 )
 
                 # Create temporary file for this part
                 part_file_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}_part_{i}.{FORMAT}"
+                    temp_line_audio_dir,
+                    f"line_{line_index:06d}_part_{i}.{API_OUTPUT_FORMAT}",
                 )
 
-                current_part_audio_buffer = bytearray()
                 try:
-                    # Generate audio for the part
-                    # FORMAT is defined globally, ensure it's correct for orpheus vs kokoro
-                    async with async_openai_client.audio.speech.with_streaming_response.create(
-                        model=MODEL,
-                        voice=voice_to_speak_in,
-                        response_format=FORMAT,
+                    # Use retry mechanism for TTS generation (multi-voice)
+                    current_part_audio_buffer = await generate_tts_with_retry(
+                        async_openai_client,
+                        MODEL,
+                        voice_to_speak_in,
+                        text_to_speak,
+                        API_OUTPUT_FORMAT,
                         speed=0.85,
-                        input=text_to_speak,
-                    ) as response:
-                        if response.status_code != 200:
-                            print(
-                                f"ERROR (multi-voice): TTS API returned status {response.status_code} for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak}'"
-                            )
-                            try:
-                                error_content = await response.aread()
-                                print(
-                                    f"ERROR CONTENT (multi-voice): {error_content.decode()}"
-                                )
-                            except Exception as e_read:
-                                print(
-                                    f"ERROR (multi-voice): Could not read error content: {e_read}"
-                                )
-                            continue  # Skip to the next part in the line
-
-                        async for chunk in response.iter_bytes():
-                            current_part_audio_buffer.extend(chunk)
+                        max_retries=5,
+                        task_id=task_id,
+                    )
 
                     # Save this part to a temporary file
                     if len(current_part_audio_buffer) > 0:
@@ -839,19 +1132,24 @@ async def generate_audio_with_multiple_voices(
                         part_files.append(part_file_path)
                     else:
                         print(
-                            f"WARNING (multi-voice): TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...' returned 0 bytes despite 200 OK."
+                            f"WARNING (multi-voice): TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...' returned 0 bytes after retries."
                         )
 
+                except asyncio.CancelledError:
+                    # Re-raise cancellation errors
+                    raise
                 except Exception as e:
                     print(
-                        f"ERROR (multi-voice) processing TTS for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...': {e}"
+                        f"CRITICAL ERROR (multi-voice): TTS failed after all retries for part type '{part['type']}', voice '{voice_to_speak_in}', text: '{text_to_speak[:50]}...': {e}"
                     )
-                    continue  # Skip to the next part
+                    # This is now a critical error since we've exhausted retries
+                    # We should not continue as this will result in missing audio
+                    raise e
 
             # Concatenate all parts using FFmpeg
             if part_files:
                 final_line_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
+                    temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
 
                 if len(part_files) == 1:
@@ -929,7 +1227,7 @@ async def generate_audio_with_multiple_voices(
                                 f.write(f"file '{os.path.abspath(norm_file)}'\n")
 
                         # Final concatenation to target format
-                        if FORMAT == "wav":
+                        if API_OUTPUT_FORMAT == "wav":
                             concat_cmd = [
                                 "ffmpeg",
                                 "-y",
@@ -1012,6 +1310,29 @@ async def generate_audio_with_multiple_voices(
     # Initialize results_all list
     results_all = [None] * len(json_data_array)
 
+    # Create a cancellation monitor task for multi-voice
+    async def cancellation_monitor_mv():
+        while tasks:
+            await asyncio.sleep(0.5)  # Check every 500ms
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Multi-voice cancellation monitor detected task {task_id} is cancelled"
+                )
+                # Cancel all remaining tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(
+                            f"[DEBUG] Multi-voice cancellation monitor cancelled a task"
+                        )
+                # clean up the temp directory
+                shutil.rmtree(f"{TEMP_DIR}/{book_title}")
+                os.rmdir(f"{TEMP_DIR}/{book_title}")
+                break
+
+    # Start the cancellation monitor
+    monitor_task_mv = asyncio.create_task(cancellation_monitor_mv())
+
     # Process tasks with progress updates
     last_reported = -1
     while tasks:
@@ -1028,21 +1349,55 @@ async def generate_audio_with_multiple_voices(
         if progress_counter > last_reported:
             last_reported = progress_counter
             percent = (progress_counter / total_lines) * 100
+
+            # Check if task has been cancelled
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Multi-voice task {task_id} was cancelled, cancelling all pending tasks"
+                )
+                # Cancel all pending tasks immediately
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(f"[DEBUG] Cancelled pending multi-voice task")
+                raise asyncio.CancelledError("Task was cancelled by user")
+
+            # update the task status
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {percent:.1f}%",
+            )
             yield f"Generating audiobook. Progress: {percent:.1f}%"
 
     # All tasks have completed at this point and results_all is populated
     results = [r for r in results_all if r is not None]  # Filter out empty lines
 
+    # Clean up the monitor task
+    if not monitor_task_mv.done():
+        monitor_task_mv.cancel()
+
     progress_bar.close()
 
     # Filter out empty lines (same as in your original code)
     results = [r for r in results_all if r is not None]
-
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
+    )
     yield "Completed generating audio for all lines"
 
     # Second pass: Organize by chapters
     chapter_organization_bar = tqdm(
         total=len(results), unit="result", desc="Organizing Chapters"
+    )
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
     )
     yield "Organizing lines into chapters"
 
@@ -1050,11 +1405,12 @@ async def generate_audio_with_multiple_voices(
         # Check if this is a chapter heading
         if result["is_chapter_heading"]:
             chapter_index += 1
+
             if MODEL == "orpheus":
                 current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
             else:
                 current_chapter_audio = (
-                    f"{sanitize_filename(result['line'])}.{CHAPTER_FORMAT}"
+                    f"{sanitize_filename(result['line'])}.{output_format}"
                 )
 
         if current_chapter_audio not in chapter_files:
@@ -1062,118 +1418,72 @@ async def generate_audio_with_multiple_voices(
             chapter_line_map[current_chapter_audio] = []
 
         # Add this line index to the chapter
+        # The 'index' from 'result' is crucial for concatenate_chapters to find the correct audio files
         chapter_line_map[current_chapter_audio].append(result["index"])
         chapter_organization_bar.update(1)
 
     chapter_organization_bar.close()
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
+    )
     yield f"Organized {len(results)} lines into {len(chapter_files)} chapters"
 
-    # Third pass: Concatenate audio files for each chapter in order
-    chapter_assembly_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
+    concatenate_chapters(
+        chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
 
-    for chapter_file in chapter_files:
-        # Force m4a extension for chapter files with Orpheus to avoid issues
-        if MODEL == "orpheus":
-            chapter_path = os.path.join(
-                temp_audio_dir, f"{chapter_file.split('.')[0]}.m4a"
-            )
-        else:
-            chapter_path = os.path.join(temp_audio_dir, chapter_file)
-
-        # Create a temporary file list for this chapter's lines
-        chapter_lines_list = "chapter_lines_list.txt"
-        with open(chapter_lines_list, "w", encoding="utf-8") as f:
-            for line_index in sorted(chapter_line_map[chapter_file]):
-                line_audio_path = os.path.join(
-                    temp_line_audio_dir, f"line_{line_index:06d}.{FORMAT}"
-                )
-                f.write(f"file '{line_audio_path}'\n")
-
-        # Use FFmpeg to concatenate the lines
-        if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly
-            ffmpeg_cmd = (
-                f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} "
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 "{chapter_path}"'
-            )
-        else:
-            # For other models, we can use copy
-            ffmpeg_cmd = f"ffmpeg -y -f concat -safe 0 -i {chapter_lines_list} -c copy '{chapter_path}'"
-
-        # Print the command for debugging
-        print(f"[DEBUG] FFmpeg command: {ffmpeg_cmd}")
-        try:
-            result = subprocess.run(
-                ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
-            )
-            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
-            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
-        except subprocess.CalledProcessError as e:
-            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
-            print(f"[ERROR] Command: {ffmpeg_cmd}")
-            print(f"[ERROR] Stdout: {e.stdout}")
-            print(f"[ERROR] Stderr: {e.stderr}")
-            raise e
-
-        chapter_assembly_bar.update(1)
-        yield f"Assembled chapter: {chapter_file}"
-
-        # Clean up the temporary file list
-        os.remove(chapter_lines_list)
-
-    chapter_assembly_bar.close()
-
-    # Post-processing steps
-    post_processing_bar = tqdm(
-        total=len(chapter_files) * 2, unit="task", desc="Post Processing"
+    # Optimized parallel post-processing
+    yield "Starting parallel post-processing..."
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
     )
-
-    # Add silence to each chapter file
-    for chapter_file in chapter_files:
-        add_silence_to_audio_file_by_appending_pre_generated_silence(
-            temp_audio_dir, chapter_file, CHAPTER_FORMAT
-        )
-        post_processing_bar.update(1)
-        yield f"Added silence to chapter: {chapter_file}"
-
-    m4a_chapter_files = []
-
-    # Convert all chapter files to M4A format
-    for chapter_file in chapter_files:
-        chapter_name = chapter_file.split(f".{CHAPTER_FORMAT}")[0]
-        m4a_chapter_files.append(f"{chapter_name}.m4a")
-        # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(CHAPTER_FORMAT, "m4a", temp_audio_dir, chapter_name)
-        post_processing_bar.update(1)
-        yield f"Converted chapter: {chapter_file}"
-
-    post_processing_bar.close()
+    m4a_chapter_files = await parallel_post_processing(
+        chapter_files, book_title, output_format
+    )
+    yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
 
     # Clean up temp line audio files
     yield "Cleaning up temporary files"
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
+    )
     shutil.rmtree(temp_line_audio_dir)
     yield "Temporary files cleanup complete"
 
     if generate_m4b_audiobook_file:
         # Merge all chapter files into a final m4b audiobook
         yield "Creating M4B audiobook file..."
-        merge_chapters_to_m4b(book_path, m4a_chapter_files)
+        merge_chapters_to_m4b(book_path, m4a_chapter_files, book_title)
+        # clean the temp directory
+        shutil.rmtree(f"{TEMP_DIR}/{book_title}")
         yield "M4B audiobook created successfully"
     else:
         # Merge all chapter files into a standard M4A audiobook
         yield "Creating final audiobook..."
-        merge_chapters_to_standard_audio_file(m4a_chapter_files)
+        merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
         safe_book_title = sanitize_book_title_for_filename(book_title)
         convert_audio_file_formats(
-            "m4a", output_format, "generated_audiobooks", safe_book_title
+            API_OUTPUT_FORMAT, output_format, "generated_audiobooks", safe_book_title
         )
         yield f"Audiobook in {output_format} format created successfully"
 
 
 async def process_audiobook_generation(
-    voice_option, narrator_gender, output_format, book_path, book_title="audiobook"
+    voice_option,
+    narrator_gender,
+    output_format,
+    book_path,
+    book_title="audiobook",
+    task_id=None,
 ):
     # Select narrator voice string based on narrator_gender and MODEL
     if narrator_gender == "male":
@@ -1187,46 +1497,51 @@ async def process_audiobook_generation(
         else:
             narrator_voice = "tara"
 
-    is_kokoro_api_up, message = await check_tts_api(
+    is_tts_api_up, message = await check_tts_api(
         async_openai_client, MODEL, narrator_voice
     )
 
-    if not is_kokoro_api_up:
+    if not is_tts_api_up:
         raise Exception(message)
 
     generate_m4b_audiobook_file = False
+    # Determine the actual format to use for intermediate files
+    actual_output_format = output_format
 
     if output_format == "M4B (Chapters & Cover)":
         generate_m4b_audiobook_file = True
+        actual_output_format = "m4a"  # Use m4a for intermediate files when creating M4B
 
     if voice_option == "Single Voice":
         yield "\n🎧 Generating audiobook with a **single voice**..."
         await asyncio.sleep(1)
         async for line in generate_audio_with_single_voice(
-            output_format.lower(),
+            actual_output_format.lower(),
             narrator_gender,
             generate_m4b_audiobook_file,
             book_path,
             book_title,
+            task_id,
         ):
             yield line
     elif voice_option == "Multi-Voice":
         yield "\n🎭 Generating audiobook with **multiple voices**..."
         await asyncio.sleep(1)
         async for line in generate_audio_with_multiple_voices(
-            output_format.lower(),
+            actual_output_format.lower(),
             narrator_gender,
             generate_m4b_audiobook_file,
             book_path,
             book_title,
+            task_id,
         ):
             yield line
 
     yield f"\n🎧 Audiobook is generated ! You can now download it in the Download section below. Click on the blue download link next to the file name."
 
 
-async def main():
-    os.makedirs("generated_audiobooks", exist_ok=True)
+async def main(book_title="audiobook"):
+    os.makedirs(f"{TEMP_DIR}/{book_title}/generated_audiobooks", exist_ok=True)
 
     # Default values
     book_path = "./sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub"

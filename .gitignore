@@ -3,7 +3,8 @@ books/
 generated_audiobooks/
 model_cache/
 audio_samples/
-temp_audio/
+temp/
 todo.md
-
+chapter_list.txt
+generation_tasks.json
 .*
