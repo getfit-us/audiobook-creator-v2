@@ -49,7 +49,6 @@ from utils.check_tts_api import check_tts_api
 from dotenv import load_dotenv
 import subprocess
 import random
-
 from utils.task_utils import update_task_status, is_task_cancelled
 
 load_dotenv()
@@ -60,6 +59,8 @@ API_OUTPUT_FORMAT = "wav" if MODEL == "orpheus" else "aac"
 os.makedirs("audio_samples", exist_ok=True)
 
 async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
+
+print(BASE_URL)
 
 
 def sanitize_filename(text):
@@ -140,11 +141,11 @@ def concatenate_chapters(
         total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
     )
 
-    for chapter_file in chapter_files:
-
+    def assemble_single_chapter(chapter_file):
         # Create a temporary file list for this chapter's lines
         chapter_lines_list = os.path.join(
-            f"{TEMP_DIR}/{book_title}", "chapter_lines_list.txt"
+            f"{TEMP_DIR}/{book_title}",
+            f"chapter_lines_list_{chapter_file.replace('/', '_').replace('.', '_')}.txt",
         )
 
         # Delete the chapter_lines_list file if it exists
@@ -159,16 +160,16 @@ def concatenate_chapters(
                 # Use absolute path to prevent path duplication issues
                 f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
 
-        # Use FFmpeg to concatenate the lines
+        # Use FFmpeg to concatenate the lines with optimized parameters
         if MODEL == "orpheus":
             # For Orpheus, convert WAV segments to M4A chapters directly with timestamp filtering
             ffmpeg_cmd = (
                 f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 -avoid_negative_ts make_zero -fflags +genpts "{TEMP_DIR}/{book_title}/{chapter_file}"'
+                f'-c:a aac -b:a 256k -ar 44100 -ac 2 -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
             )
         else:
             # For other models, use re-encoding with timestamp filtering to prevent truncation
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts "{TEMP_DIR}/{book_title}/{chapter_file}"'
+            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
 
         try:
             result = subprocess.run(
@@ -183,13 +184,86 @@ def concatenate_chapters(
             print(f"[ERROR] Stderr: {e.stderr}")
             raise e
 
-        chapter_assembly_bar.update(1)
         print(f"Assembled chapter: {chapter_file}")
 
         # Clean up the temporary file list
         os.remove(chapter_lines_list)
+        return chapter_file
+
+    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
+    import concurrent.futures
+
+    max_workers = min(4, len(chapter_files))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(assemble_single_chapter, chapter_file)
+            for chapter_file in chapter_files
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                chapter_file = future.result()
+                chapter_assembly_bar.update(1)
+            except Exception as e:
+                print(f"Error assembling chapter: {e}")
+                raise e
 
     chapter_assembly_bar.close()
+
+
+async def parallel_post_processing(chapter_files, book_title, output_format):
+    """
+    Parallel post-processing of chapter files to add silence and convert formats.
+    """
+
+    def process_single_chapter(chapter_file):
+        # Add silence to chapter file
+        add_silence_to_audio_file_by_appending_pre_generated_silence(
+            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
+        )
+
+        # Convert to M4A format if needed
+        chapter_name = chapter_file.split(f".{output_format}")[0]
+        m4a_chapter_file = f"{chapter_name}.m4a"
+
+        # Only convert if not already in M4A format
+        if not chapter_file.endswith(".m4a"):
+            convert_audio_file_formats(
+                output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
+            )
+
+        return m4a_chapter_file
+
+    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
+    import concurrent.futures
+
+    max_workers = min(4, len(chapter_files))
+    m4a_chapter_files = []
+
+    post_processing_bar = tqdm(
+        total=len(chapter_files), unit="chapter", desc="Post Processing (Parallel)"
+    )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_single_chapter, chapter_file)
+            for chapter_file in chapter_files
+        ]
+
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                m4a_chapter_file = future.result()
+                m4a_chapter_files.append(m4a_chapter_file)
+                post_processing_bar.update(1)
+            except Exception as e:
+                print(f"Error in post-processing: {e}")
+                raise e
+
+    post_processing_bar.close()
+
+    # Sort to maintain chapter order
+    m4a_chapter_files.sort()
+    return m4a_chapter_files
 
 
 def find_voice_for_gender_score(character: str, character_gender_map, voice_map):
@@ -865,33 +939,12 @@ async def generate_audio_with_single_voice(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
 
-    # Post-processing steps
-    post_processing_bar = tqdm(
-        total=len(chapter_files) * 2, unit="task", desc="Post Processing"
+    # Optimized parallel post-processing
+    yield "Starting parallel post-processing..."
+    m4a_chapter_files = await parallel_post_processing(
+        chapter_files, book_title, output_format
     )
-
-    # Add silence to each chapter file
-    for chapter_file in chapter_files:
-        add_silence_to_audio_file_by_appending_pre_generated_silence(
-            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
-        )
-        post_processing_bar.update(1)
-        yield f"Added silence to chapter: {chapter_file}"
-
-    m4a_chapter_files = []
-
-    # Convert all chapter files to M4A format
-    for chapter_file in chapter_files:
-        chapter_name = chapter_file.split(f".{output_format}")[0]
-        m4a_chapter_files.append(f"{chapter_name}.m4a")
-        # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(
-            output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
-        )
-        post_processing_bar.update(1)
-        yield f"Converted chapter: {chapter_file}"
-
-    post_processing_bar.close()
+    yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
 
     # Clean up temp line audio files
     shutil.rmtree(temp_line_audio_dir)
@@ -1382,45 +1435,18 @@ async def generate_audio_with_multiple_voices(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
 
-    # Post-processing steps
-    post_processing_bar = tqdm(
-        total=len(chapter_files) * 2, unit="task", desc="Post Processing"
+    # Optimized parallel post-processing
+    yield "Starting parallel post-processing..."
+    # update the task status
+    update_task_status(
+        task_id,
+        "generating",
+        f"Generating audiobook. Progress: {percent:.1f}%",
     )
-
-    # Add silence to each chapter file
-    for chapter_file in chapter_files:
-        add_silence_to_audio_file_by_appending_pre_generated_silence(
-            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
-        )
-        post_processing_bar.update(1)
-        # update the task status
-        update_task_status(
-            task_id,
-            "generating",
-            f"Generating audiobook. Progress: {percent:.1f}%",
-        )
-        yield f"Added silence to chapter: {chapter_file}"
-
-    m4a_chapter_files = []
-
-    # Convert all chapter files to M4A format
-    for chapter_file in chapter_files:
-        chapter_name = chapter_file.split(f".{output_format}")[0]
-        m4a_chapter_files.append(f"{chapter_name}.m4a")
-        # Convert to M4A as raw WAV/AAC have problems with timestamps and metadata
-        convert_audio_file_formats(
-            output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
-        )
-        post_processing_bar.update(1)
-        # update the task status
-        update_task_status(
-            task_id,
-            "generating",
-            f"Generating audiobook. Progress: {percent:.1f}%",
-        )
-        yield f"Converted chapter: {chapter_file}"
-
-    post_processing_bar.close()
+    m4a_chapter_files = await parallel_post_processing(
+        chapter_files, book_title, output_format
+    )
+    yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
 
     # Clean up temp line audio files
     yield "Cleaning up temporary files"

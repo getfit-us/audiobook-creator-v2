@@ -506,12 +506,25 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
         f'-metadata description="{comments}"'
     )
 
+    # Optimized FFmpeg command with threading and better performance
     ffmpeg_cmd = (
         f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
-        f'-c:a aac -b:a 256k -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 -avoid_negative_ts make_zero -fflags +genpts {metadata} "{output_m4b}"'
+        f"-c:a copy -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 "
+        f'-avoid_negative_ts make_zero -fflags +genpts -threads 0 {metadata} "{output_m4b}"'
     )
 
-    subprocess.run(ffmpeg_cmd, shell=True, check=True)
+    try:
+        # Try with copy codec first (fastest)
+        subprocess.run(ffmpeg_cmd, shell=True, check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        # Fallback to re-encoding if copy fails
+        print("Copy codec failed for M4B, falling back to re-encoding...")
+        ffmpeg_cmd = (
+            f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
+            f"-c:a aac -b:a 256k -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 "
+            f'-avoid_negative_ts make_zero -fflags +genpts -threads 0 {metadata} "{output_m4b}"'
+        )
+        subprocess.run(ffmpeg_cmd, shell=True, check=True)
     print(f"Audiobook created: {output_m4b}")
 
 
@@ -525,6 +538,7 @@ def add_silence_to_audio_file_by_appending_pre_generated_silence(
     temp_output_path = f"{temp_dir}/temp_with_silence_{input_file_name}"
 
     # Use FFmpeg to properly add silence without corrupting the file
+    # Optimized with threading and faster processing
     ffmpeg_cmd = [
         "ffmpeg",
         "-y",
@@ -538,6 +552,8 @@ def add_silence_to_audio_file_by_appending_pre_generated_silence(
         "[out]",
         "-c:a",
         "aac",  # Ensure consistent encoding
+        "-threads",
+        "0",  # Use all available CPU cores
         temp_output_path,
     ]
 
@@ -615,12 +631,18 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
     # Construct the output file path
     output_file = f"generated_audiobooks/{safe_book_title}.m4a"
 
-    # Use re-encoding instead of copy to prevent truncation issues
-    # that can occur at file boundaries, especially at the end
-    ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts "{output_file}"'
+    # Use optimized FFmpeg parameters for faster processing
+    # Use copy codec when possible to avoid re-encoding, add threading
+    ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a copy -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
 
-    # Run the ffmpeg command
-    subprocess.run(ffmpeg_cmd, shell=True, check=True)
+    try:
+        # Run the ffmpeg command with copy codec first (fastest)
+        subprocess.run(ffmpeg_cmd, shell=True, check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        # Fallback to re-encoding if copy fails
+        print("Copy codec failed, falling back to re-encoding...")
+        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
+        subprocess.run(ffmpeg_cmd, shell=True, check=True)
 
     # Print a message when the generation is complete
     print(f"Audiobook created: {output_file}")
