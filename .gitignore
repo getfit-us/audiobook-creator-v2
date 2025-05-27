@@ -8,5 +8,7 @@ todo.md
 chapter_list.txt
 generation_tasks.json
 .*
-
+tasks.json
+cover.jpg
+character_gender_map.json
 /test*
