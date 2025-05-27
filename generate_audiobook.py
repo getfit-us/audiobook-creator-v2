@@ -40,6 +40,7 @@ from utils.run_shell_commands import (
 )
 from utils.file_utils import concatenate_audio_files, read_json, empty_directory
 from utils.audiobook_utils import (
+    add_silence_to_audio_file_by_appending_silence_file,
     merge_chapters_to_m4b,
     convert_audio_file_formats,
     merge_chapters_to_standard_audio_file,
@@ -222,11 +223,12 @@ async def parallel_post_processing(chapter_files, book_title, output_format):
     Parallel post-processing of chapter files to add silence and convert formats.
     """
 
+    print(
+        f"chapter_files: {chapter_files}, book_title: {book_title}, output_format: {output_format}"
+    )
+
     def process_single_chapter(chapter_file):
         # Add silence to chapter file
-        add_silence_to_audio_file_by_appending_pre_generated_silence(
-            f"{TEMP_DIR}/{book_title}", chapter_file, output_format
-        )
 
         # Convert to M4A format if needed
         chapter_name = chapter_file.split(f".{output_format}")[0]
@@ -237,6 +239,10 @@ async def parallel_post_processing(chapter_files, book_title, output_format):
             convert_audio_file_formats(
                 output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
             )
+        else:
+            m4a_chapter_file = chapter_file
+
+        add_silence_to_audio_file_by_appending_silence_file(m4a_chapter_file)
 
         return m4a_chapter_file
 
@@ -596,10 +602,14 @@ async def generate_audio_files(
     # Setup directories
     temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    empty_directory(os.path.join(temp_line_audio_dir, book_title))
-
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(temp_line_audio_dir, exist_ok=True)
+    # if the directory exists we may resume from the last line or use the files to create a different format of the audiobook (e.g. mp3) saving time from re-generating the audio files
+    if os.path.exists(temp_line_audio_dir):
+        resume_index, _ = get_task_progress_index(task_id)
+        print(f"Resuming from line {resume_index}")
+    else:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        empty_directory(os.path.join(temp_line_audio_dir, book_title))
+        os.makedirs(temp_line_audio_dir, exist_ok=True)
 
     # Batch processing parameters
     semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS_BATCH_SIZE)
@@ -629,6 +639,27 @@ async def generate_audio_files(
 
     # Maps chapters to their line indices
     chapter_line_map = {}
+
+    async def update_progress_and_task_status(
+        line_index,
+        actual_text_content,
+    ):
+        nonlocal progress_counter
+        async with progress_lock:
+            progress_bar.update(1)
+            progress_counter = progress_counter + 1
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {progress_counter}/{total_lines}",
+            )
+            set_task_progress_index(task_id, progress_counter, total_lines)
+
+            return {
+                "index": line_index,
+                "is_chapter_heading": check_if_chapter_heading(actual_text_content),
+                "line": actual_text_content,  # Return the processed text content
+            }
 
     async def process_single_line(
         line_index,
@@ -695,6 +726,14 @@ async def generate_audio_files(
             line_audio_path = os.path.join(
                 temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
             )
+            # if the line audio file exists and is not empty, we can skip the line
+            if (
+                os.path.exists(line_audio_path)
+                and os.path.getsize(line_audio_path) > 1024
+            ):
+                return await update_progress_and_task_status(
+                    line_index, actual_text_content
+                )
 
             try:
                 for i, part in enumerate(annotated_parts):
@@ -742,6 +781,7 @@ async def generate_audio_files(
                         )
 
                     try:
+
                         current_part_audio_buffer = await generate_tts_with_retry(
                             MODEL,
                             voice_to_use_for_this_part,  # Use the correctly determined voice
@@ -806,21 +846,9 @@ async def generate_audio_files(
                 with open(line_audio_path, "wb") as f:
                     f.write(b"")
 
-            async with progress_lock:
-                progress_bar.update(1)
-                progress_counter += 1
-                update_task_status(
-                    task_id,
-                    "generating",
-                    f"Generating audiobook. Progress: {progress_counter}/{total_lines}",
-                )
-                set_task_progress_index(task_id, progress_counter, total_lines)
-
-            return {
-                "index": line_index,
-                "is_chapter_heading": check_if_chapter_heading(actual_text_content),
-                "line": actual_text_content,  # Return the processed text content
-            }
+            return await update_progress_and_task_status(
+                line_index, actual_text_content
+            )
 
     # Create tasks and store them with their index for result collection
     tasks = []
@@ -970,6 +998,9 @@ async def generate_audio_files(
     concatenate_chapters(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
+    post_processing_bar = tqdm(
+        total=len(chapter_files), unit="chapter", desc="Adding Silence"
+    )
 
     # Optimized parallel post-processing
     yield "Starting parallel post-processing..."
@@ -979,8 +1010,8 @@ async def generate_audio_files(
     yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
 
     # Clean up temp line audio files
-    shutil.rmtree(temp_line_audio_dir)
-    yield "Cleaned up temporary files"
+    # shutil.rmtree(temp_line_audio_dir)
+    # yield "Cleaned up temporary files"
 
     # create audiobook directory if it does not exist
     os.makedirs(f"generated_audiobooks", exist_ok=True)
@@ -997,8 +1028,9 @@ async def generate_audio_files(
         yield "Creating final audiobook..."
         merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
         safe_book_title = sanitize_book_title_for_filename(book_title)
+        # always convert to m4a first
         convert_audio_file_formats(
-            API_OUTPUT_FORMAT, output_format, "generated_audiobooks", safe_book_title
+            "m4a", output_format, "generated_audiobooks", safe_book_title
         )
         yield f"Audiobook in {output_format} format created successfully"
 

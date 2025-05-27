@@ -37,6 +37,7 @@ from utils.task_utils import (
     cancel_task,
     register_running_task,
     unregister_running_task,
+    clear_temp_files,
 )
 
 css = """
@@ -444,16 +445,9 @@ def clear_old_tasks(keep_recent_hours=24):
 
 
 def clear_old_tasks_wrapper():
-    """Wrapper for clearing old tasks with user feedback"""
+    """Wrapper for clearing temp files including tasks"""
     try:
-        tasks_removed = clear_old_tasks()
-        if tasks_removed > 0:
-            return gr.Info(
-                f"Cleared {tasks_removed} old task(s) from the tracking system.",
-                duration=5,
-            )
-        else:
-            return gr.Info("No old tasks to clear.", duration=3)
+        clear_temp_files()
     except Exception as e:
         print(f"Error clearing old tasks: {e}")
         return gr.Warning(f"Error clearing old tasks: {str(e)}")
@@ -708,7 +702,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     "🔄 Refresh List", variant="secondary", size="sm"
                 )
                 clear_tasks_btn = gr.Button(
-                    "🧹 Clear Old Tasks", variant="secondary", size="sm"
+                    "🧹 Clear All Temp Files", variant="secondary", size="sm"
                 )
 
             # Task cancellation section
@@ -834,7 +828,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         ],
     )
 
-    # Clear old tasks when the clear tasks button is clicked
+    # Clear Temp Files when the clear tasks button is clicked
     clear_tasks_btn.click(
         clear_old_tasks_wrapper,
         outputs=[],

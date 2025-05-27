@@ -20,7 +20,7 @@ import subprocess
 import re
 import os
 import traceback
-from config.constants import TEMP_DIR
+from config.constants import CHAPTER_LIST_FILE, FFMPEG_METADATA_FILE, TEMP_DIR
 from utils.run_shell_commands import run_shell_command
 
 
@@ -253,7 +253,7 @@ def get_audio_duration_using_raw_ffmpeg(file_path):
 
 
 def generate_chapters_file(
-    chapter_files, book_title="audiobook", output_file="chapters.txt"
+    chapter_files, book_title="audiobook", output_file=FFMPEG_METADATA_FILE
 ):
     """
     Generates a chapter metadata file for FFmpeg.
@@ -465,7 +465,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
         chapter_files (list): A list of the paths to the individual chapter audio files.
         book_title (str): The title/name of the book for directory structure.
     """
-    file_list_path = "chapter_list.txt"
+    file_list_path = f"{TEMP_DIR}/{book_title}/{CHAPTER_LIST_FILE}"
 
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
@@ -480,7 +480,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
     comments = escape_metadata(metadata.get("Comments", ""))
 
     # Generate chapter metadata
-    generate_chapters_file(chapter_files, book_title, "chapters.txt")
+    generate_chapters_file(chapter_files, book_title, FFMPEG_METADATA_FILE)
 
     # Use sanitized book title for filename to avoid issues with spaces
     safe_book_title = "".join(
@@ -492,7 +492,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
 
     output_m4b = f"generated_audiobooks/{safe_book_title}.m4b"
     cover_image = f"{TEMP_DIR}/{book_title}/cover.jpg"
-    chapters_file = f"{TEMP_DIR}/{book_title}/chapters.txt"
+    chapters_file = f"{TEMP_DIR}/{book_title}/{FFMPEG_METADATA_FILE}"
 
     # Construct metadata arguments safely
     metadata = (
@@ -577,30 +577,16 @@ def add_silence_to_audio_file_by_appending_pre_generated_silence(
             audio_file.write(silence_file.read())
 
 
-def add_silence_to_audio_file_by_reencoding_using_ffmpeg(
-    temp_dir, input_file_name, pause_duration
-):
-    """
-    Adds a silence of specified duration at the end of an audio file.
+def add_silence_to_audio_file_by_appending_silence_file(
+    input_file_path):
+    silence_path = "static_files/silence.aac"  # Pre generated 1 seconds of silence using command `ffmpeg -f lavfi -i anullsrc=r=44100:cl=mono -t 1 -c:a aac silence.aac`
 
-    Args:
-        temp_dir (str): The temporary directory to store the silence file.
-        input_file_name (str): The name of the file to add silence to.
-        pause_duration (str): The duration of the silence (e.g. 00:00:05).
-    """
-    # Generate a silence file with the specified duration
-    generate_silence_command = f'ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=mono -t {pause_duration} -c:a aac "{temp_dir}/silence.aac"'
-    subprocess.run(generate_silence_command, shell=True, check=True)
-
-    # Add the silence to the end of the audio file
-    add_silence_command = f'ffmpeg -y -i "{temp_dir}/{input_file_name}" -i "{temp_dir}/silence.aac" -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" "{temp_dir}/temp_dir_file.aac"'
-    subprocess.run(add_silence_command, shell=True, check=True)
-
-    # Rename the temporary file back to the original file name
-    rename_file_command = (
-        f'mv "{temp_dir}/temp_dir_file.aac" "{temp_dir}/{input_file_name}"'
-    )
-    subprocess.run(rename_file_command, shell=True, check=True)
+    with open(silence_path, "rb") as silence_file, open(
+        input_file_path, "ab"
+    ) as audio_file:
+        audio_file.write(
+            silence_file.read()
+        )  # Append silence to the end of the audio file
 
 
 def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook"):
@@ -613,12 +599,16 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
         chapter_files (list): A list of the paths to the individual chapter audio files.
         book_title (str): The title/name of the book for directory structure.
     """
-    file_list_path = "chapter_list.txt"
+    file_list_path = f"{TEMP_DIR}/{book_title}/{CHAPTER_LIST_FILE}"
 
     # Write the list of chapter files to a text file (ffmpeg input)
     with open(file_list_path, "w", encoding="utf-8") as f:
         for chapter in chapter_files:
-            f.write(f"file '{os.path.join(TEMP_DIR, book_title, chapter)}'\n")
+            # Use absolute path for each chapter file
+            abs_chapter_path = os.path.abspath(
+                os.path.join(TEMP_DIR, book_title, chapter)
+            )
+            f.write(f"file '{abs_chapter_path}'\n")
 
     # Use sanitized book title for filename to avoid issues with spaces
     safe_book_title = "".join(
@@ -633,7 +623,7 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
 
     # Use optimized FFmpeg parameters for faster processing
     # Use copy codec when possible to avoid re-encoding, add threading
-    ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a copy -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
+    ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{file_list_path}" -c:a copy -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
 
     try:
         # Run the ffmpeg command with copy codec first (fastest)
@@ -641,7 +631,7 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
     except subprocess.CalledProcessError:
         # Fallback to re-encoding if copy fails
         print("Copy codec failed, falling back to re-encoding...")
-        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
+        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{file_list_path}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
         subprocess.run(ffmpeg_cmd, shell=True, check=True)
 
     # Print a message when the generation is complete

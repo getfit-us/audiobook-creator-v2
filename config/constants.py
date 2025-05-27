@@ -16,4 +16,6 @@ VOICE_MAP = (
     if MODEL == "kokoro"
     else read_json("static_files/orpheus_voice_map_male_narrator.json")
 )
+CHAPTER_LIST_FILE = "chapter_list.txt"
+FFMPEG_METADATA_FILE = "ffmpeg_metadata.txt"
 TASKS_FILE = "tasks.json"

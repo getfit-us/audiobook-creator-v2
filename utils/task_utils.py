@@ -1,13 +1,30 @@
 import glob
 import json
-import time
+import shutil
 import os
 from datetime import datetime
 
-from config.constants import TASKS_FILE
+from config.constants import TASKS_FILE, TEMP_DIR
 
 # Global dictionary to store running task references
 _running_tasks = {}
+
+
+def clear_temp_files():
+    """Clear all temp files including tasks"""
+    try:
+        # Clear tasks file
+        if os.path.exists(TASKS_FILE):
+            os.remove(TASKS_FILE)
+
+        # Clear Temp Directory
+        if os.path.exists(TEMP_DIR):
+            shutil.rmtree(TEMP_DIR)
+
+        # Create Temp Directory
+        os.makedirs(TEMP_DIR, exist_ok=True)
+    except:
+        pass
 
 
 def get_past_generated_files():
@@ -142,17 +159,11 @@ def get_active_tasks():
     tasks = load_tasks()
     active_tasks = []
     current_time = datetime.now()
-    tasks_to_clean = []
 
     for task_id, task_info in tasks.items():
         try:
             timestamp = datetime.fromisoformat(task_info["timestamp"])
             hours_old = (current_time - timestamp).total_seconds() / 3600
-
-            # Automatically remove very old tasks (older than 48 hours)
-            if hours_old > 48:
-                tasks_to_clean.append(task_id)
-                continue
 
             if task_info.get("status") in ["running", "starting", "generating"]:
                 # Check if task is still actually running (simple heuristic)
@@ -165,19 +176,9 @@ def get_active_tasks():
                             "status": task_info.get("status", "running"),
                         }
                     )
-                else:
-                    # Mark old running tasks for cleanup
-                    tasks_to_clean.append(task_id)
-        except:
-            # Mark tasks with invalid timestamps for cleanup
-            tasks_to_clean.append(task_id)
 
-    # Clean up old tasks
-    if tasks_to_clean:
-        for task_id in tasks_to_clean:
-            if task_id in tasks:
-                del tasks[task_id]
-        save_tasks(tasks)
+        except:
+            pass
 
     return active_tasks
 
