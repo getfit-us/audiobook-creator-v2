@@ -213,6 +213,7 @@ def process_book_and_extract_text(
     text_decoding_option: str = "textract",
     title: str = "converted_book.txt",
 ):
+    print(f"🔄 Processing book: {book_path}")
     if text_decoding_option == "calibre":
         text: str = extract_text_from_book_using_calibre(book_path)
     else:

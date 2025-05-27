@@ -19,6 +19,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import gradio as gr
 import os
 import traceback
+import shutil
 
 from datetime import datetime
 from fastapi import FastAPI
@@ -106,13 +107,15 @@ def delete_audiobook_file(file_path):
         return gr.Warning(f"Error deleting file: {str(e)}")
 
 
-def refresh_past_files():
-    """Refresh the list of past generated files"""
+def refresh_past_files_with_continue():
     files = get_past_generated_files()
     active_tasks = get_active_tasks()
+    tasks = load_tasks()
 
     # Build display text
     display_parts = []
+    continue_btn_visible = False
+    selected_task_id = None
 
     # Show active tasks first
     if active_tasks:
@@ -123,6 +126,13 @@ def refresh_past_files():
             )
             display_parts.append(task_display)
         display_parts.append("")  # Empty line
+        # If any active task is not completed or cancelled, show continue button
+        for task in active_tasks:
+            status = tasks.get(task["id"], {}).get("status", "")
+            if status not in ["completed", "cancelled"]:
+                continue_btn_visible = True
+                selected_task_id = task["id"]
+                break
 
     # Show past files
     if not files:
@@ -150,7 +160,8 @@ def refresh_past_files():
             gr.update(visible=bool(file_choices)),
             dropdown_update,  # Return active tasks dropdown update
             group_update,  # Return cancel task group visibility update
-        )  # Show delete button if files exist
+            gr.update(visible=continue_btn_visible),  # Continue button visibility
+        )
 
     file_text = "\n\n".join(display_parts)
     dropdown_update, group_update = get_active_tasks_for_dropdown()
@@ -160,7 +171,8 @@ def refresh_past_files():
         gr.update(visible=False),
         dropdown_update,  # Return active tasks dropdown update
         group_update,  # Return cancel task group visibility update
-    )  # Hide delete button if no files
+        gr.update(visible=continue_btn_visible),  # Continue button visibility
+    )
 
 
 def validate_book_upload(book_file, book_title):
@@ -181,10 +193,12 @@ def text_extraction_wrapper(book_file, text_decoding_option, book_title):
         return gr.Warning("Please upload a book file and enter a title first.")
 
     try:
+        # Copy uploaded file to temp dir and use that path
+        safe_book_file = save_uploaded_file_to_temp(book_file, book_title)
         last_output = None
         # Pass through all yield values from the original function
         for output in process_book_and_extract_text(
-            book_file, text_decoding_option, book_title
+            safe_book_file, text_decoding_option, book_title
         ):
             last_output = output
             yield output  # Yield each progress update
@@ -249,6 +263,26 @@ async def identify_characters_wrapper(book_title):
         return
 
 
+def save_uploaded_file_to_temp(book_file, book_title):
+    """Copy uploaded file to a safe temp directory and return the new absolute path."""
+    temp_dir = os.path.abspath(os.path.join("temp", book_title))
+    os.makedirs(temp_dir, exist_ok=True)
+    filename = os.path.basename(
+        book_file.name if hasattr(book_file, "name") else book_file
+    )
+    dest_path = os.path.abspath(os.path.join(temp_dir, filename))
+    # Get absolute path for source file
+    src_path = os.path.abspath(
+        book_file.name if hasattr(book_file, "name") else book_file
+    )
+    shutil.copy(src_path, dest_path)
+    # Set permissions: readable and writable by user, group, and others
+    import os as _os
+
+    _os.chmod(dest_path, 0o666)
+    return dest_path
+
+
 async def generate_audiobook_wrapper(
     voice_type, narrator_gender, output_format, book_file, book_title
 ):
@@ -266,6 +300,23 @@ async def generate_audiobook_wrapper(
         yield None, None
         return
 
+    # Check if character identification is required and completed
+    if voice_type == "Multi-Voice":
+        # Construct the expected path for the character identification output file
+        char_ident_file_path = os.path.join(
+            "temp", book_title, "speaker_attributed_book.jsonl"
+        )
+        if not os.path.exists(char_ident_file_path):
+            yield gr.Warning(
+                "Multi-Voice narration requires character identification. "
+                "Please complete Step 3: Character Identification first."
+            ), None
+            yield None, None
+            return
+
+    # Copy uploaded file to temp dir and use that path
+    safe_book_file = save_uploaded_file_to_temp(book_file, book_title)
+
     # Create a unique task ID for tracking
     task_id = f"{book_title}_{voice_type}_{narrator_gender}_{output_format}"
 
@@ -275,6 +326,13 @@ async def generate_audiobook_wrapper(
             task_id,
             "starting",
             f"Initializing {voice_type} audiobook generation for '{book_title}'",
+            params={
+                "voice_type": voice_type,
+                "narrator_gender": narrator_gender,
+                "output_format": output_format,
+                "book_file": safe_book_file,
+                "book_title": book_title,
+            },
         )
 
         # Register the current task for cancellation
@@ -287,7 +345,12 @@ async def generate_audiobook_wrapper(
         audiobook_path = None
         # Pass through all yield values from the original function
         async for output in process_audiobook_generation(
-            voice_type, narrator_gender, output_format, book_file, book_title, task_id
+            voice_type,
+            narrator_gender,
+            output_format,
+            safe_book_file,
+            book_title,
+            task_id,
         ):
             last_output = output
             # Update task status with current progress
@@ -431,6 +494,60 @@ def get_active_tasks_for_dropdown():
     ), gr.update(visible=True)
 
 
+async def continue_audiobook_task(task_id):
+    tasks = load_tasks()
+    if not task_id or task_id not in tasks:
+        yield gr.Warning("Task not found."), None
+        yield None, None
+        return
+    params = tasks[task_id].get("params", {})
+    if not params:
+        yield gr.Warning("Task parameters not found. Cannot resume."), None
+        yield None, None
+        return
+    # Ensure the book file is in a safe temp directory
+    book_file = params["book_file"]
+    book_title = params["book_title"]
+    if not os.path.exists(book_file):
+        # Try to recover by copying from original upload if possible (not always possible)
+        yield gr.Warning(
+            "Book file not found. Please re-upload and restart the task."
+        ), None
+        yield None, None
+        return
+    # Resume the task using stored parameters
+    import asyncio
+
+    last_output = None
+    audiobook_path = None
+    async for output in process_audiobook_generation(
+        params["voice_type"],
+        params["narrator_gender"],
+        params["output_format"],
+        book_file,
+        book_title,
+        task_id,
+    ):
+        last_output = output
+        yield output, None
+    # After completion, set the output file path
+    generate_m4b_audiobook_file = (
+        True if params["output_format"] == "M4B (Chapters & Cover)" else False
+    )
+    file_extension = (
+        "m4b" if generate_m4b_audiobook_file else params["output_format"].lower()
+    )
+    safe_book_title = "".join(
+        c for c in params["book_title"] if c.isalnum() or c in (" ", "-", "_")
+    ).rstrip()
+    safe_book_title = safe_book_title or "audiobook"
+    audiobook_path = os.path.join(
+        "generated_audiobooks", f"{safe_book_title}.{file_extension}"
+    )
+    yield last_output, audiobook_path
+    return
+
+
 with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     gr.Markdown("# 📖 Audiobook Creator")
     gr.Markdown("Create professional audiobooks from your ebooks in just a few steps.")
@@ -445,7 +562,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 info="This will be used for finding the protagonist of the book in the character identification step",
             )
 
-            book_input = gr.File(label="Upload Book")
+            book_input = gr.File(label="Upload Book", interactive=True)
 
             text_decoding_option = gr.Radio(
                 ["textract", "calibre"],
@@ -455,6 +572,17 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             )
 
             validate_btn = gr.Button("Validate Book", variant="primary")
+
+    # Disable upload until title is entered
+    def enable_upload(title):
+        return gr.update(interactive=bool(title and title.strip()))
+
+    book_title.change(
+        enable_upload,
+        inputs=[book_title],
+        outputs=[book_input],
+        queue=False,
+    )
 
     with gr.Row():
         with gr.Column():
@@ -478,7 +606,14 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 placeholder="Extracted text will appear here for editing",
                 interactive=True,
                 lines=15,
+                elem_id="edit-book-content",
             )
+
+            with gr.Row():
+                goto_start_btn = gr.Button(
+                    "📄 Goto Beginning", variant="secondary", size="sm"
+                )
+                goto_end_btn = gr.Button("📄 Goto End", variant="secondary", size="sm")
 
             save_btn = gr.Button("Save Edited Text", variant="primary")
 
@@ -541,6 +676,11 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 )
 
             generate_btn = gr.Button("Generate Audiobook", variant="primary")
+
+            # Add Continue button for incomplete tasks
+            continue_btn = gr.Button(
+                "Continue Selected Task", variant="primary", visible=False
+            )
 
             audio_output = gr.Textbox(
                 label="Generation Progress",
@@ -659,9 +799,16 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     ).then(
         # Refresh past files list after successful generation
         lambda x: (
-            refresh_past_files()
+            refresh_past_files_with_continue()
             if x is not None
-            else (gr.update(), gr.update(), gr.update(), gr.update(), gr.update())
+            else (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
         ),
         inputs=[audiobook_file],
         outputs=[
@@ -670,18 +817,20 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
     )
 
     # Refresh past files when the refresh button is clicked
     refresh_btn.click(
-        refresh_past_files,
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
     )
 
@@ -691,13 +840,14 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         outputs=[],
     ).then(
         # Refresh the display after clearing tasks to update the active tasks section
-        refresh_past_files,
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
     )
 
@@ -708,13 +858,14 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         outputs=[],
     ).then(
         # Refresh the display after cancelling task
-        refresh_past_files,
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
     )
 
@@ -741,13 +892,14 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         outputs=[delete_confirmation],
     ).then(
         # Refresh the list after deletion
-        refresh_past_files,
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
     ).then(
         # Clear the download file after deletion
@@ -762,14 +914,64 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
 
     # Load past files when the app starts
     gradio_app.load(
-        refresh_past_files,
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
+            continue_btn,
         ],
+    )
+
+    # Wire up continue_btn
+    continue_btn.click(
+        continue_audiobook_task,
+        inputs=[active_tasks_dropdown],
+        outputs=[audio_output, audiobook_file],
+        queue=True,
+    ).then(
+        lambda x: (
+            gr.update(visible=True) if x is not None else gr.update(visible=False)
+        ),
+        inputs=[audiobook_file],
+        outputs=[download_box],
+    ).then(
+        lambda x: (
+            refresh_past_files_with_continue()
+            if x is not None
+            else (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+            )
+        ),
+        inputs=[audiobook_file],
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+            continue_btn,
+        ],
+    )
+
+    # Wire up goto buttons for text scrolling
+    goto_start_btn.click(
+        None,
+        js="() => { const el = document.querySelector('#edit-book-content textarea'); if (el) el.scrollTop = 0; }",
+        outputs=[],
+    )
+
+    goto_end_btn.click(
+        None,
+        js="() => { const el = document.querySelector('#edit-book-content textarea'); if (el) el.scrollTop = el.scrollHeight; }",
+        outputs=[],
     )
 
 app = gr.mount_gradio_app(app, gradio_app, path="/")  # Mount Gradio at root

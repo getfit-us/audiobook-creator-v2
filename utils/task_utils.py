@@ -70,14 +70,20 @@ def save_tasks(tasks):
         pass
 
 
-def update_task_status(task_id, status, progress="", error=None):
-    """Update task status"""
+def update_task_status(task_id, status, progress="", error=None, params=None):
+    """Update task status and optionally store parameters"""
     tasks = load_tasks()
+    if task_id in tasks:
+        # Merge params if already present
+        if params:
+            old_params = tasks[task_id].get("params", {})
+            params = {**old_params, **params}
     tasks[task_id] = {
         "status": status,
         "progress": progress,
         "timestamp": datetime.now().isoformat(),
         "error": error,
+        "params": params or tasks.get(task_id, {}).get("params", {}),
     }
     save_tasks(tasks)
 
@@ -222,3 +228,24 @@ def get_past_generated_files():
     except Exception as e:
         print(f"Error getting past files: {e}")
         return []
+
+
+def get_task_progress_index(task_id):
+    """Get the last completed line/chapter index for a task (if any)"""
+    tasks = load_tasks()
+    if task_id in tasks:
+        progress = tasks[task_id].get("progress", "")
+        import re
+
+        m = re.search(r"Progress: (\d+)/(\d+)", progress)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    return 0, 0
+
+
+def set_task_progress_index(task_id, index, total):
+    """Set the last completed line/chapter index for a task"""
+    tasks = load_tasks()
+    if task_id in tasks:
+        tasks[task_id]["progress"] = f"Generating audiobook. Progress: {index}/{total}"
+        save_tasks(tasks)

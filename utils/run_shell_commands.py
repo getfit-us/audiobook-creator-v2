@@ -20,6 +20,7 @@ import subprocess
 import shutil
 import os
 import traceback
+import sys
 
 
 def get_system_python_paths():
@@ -104,67 +105,85 @@ def check_if_ffmpeg_is_installed():
         return False
 
 
-def run_shell_command_without_virtualenv(command):
+def get_venv_python_path(venv_path):
     """
-    Runs a shell command without using a virtual environment.
+    Returns the path to the Python executable in the given virtual environment.
+    """
+    if not venv_path:
+        return None
+    python_bin = os.path.join(venv_path, "bin", "python")
+    if os.path.exists(python_bin):
+        return python_bin
+    python3_bin = os.path.join(venv_path, "bin", "python3")
+    if os.path.exists(python3_bin):
+        return python3_bin
+    return None
 
-    This function is useful when a shell command needs to be run without
-    using the dependencies installed in the virtual environment. It
-    temporarily modifies the environment to include the system Python
-    paths and then runs the command with the modified environment.
 
+def run_shell_command_without_virtualenv(command, venv_path=None):
+    """
+    Runs a shell command without using a virtual environment, or within a specified venv if provided.
     Args:
         command (str): The shell command to run.
-
+        venv_path (str, optional): Path to the virtual environment to use. Defaults to None.
     Returns:
         subprocess.CompletedProcess: The result of the command execution.
     """
-    # Get the original PYTHONPATH
     original_pythonpath = os.environ.get("PYTHONPATH", "")
-
     try:
-        # Temporarily modify the environment
         modified_env = os.environ.copy()
-
-        # Get system Python paths automatically
-        system_paths = get_system_python_paths()
-
-        if not system_paths:
-            raise Exception("No system Python paths found")
-
-        modified_env["PYTHONPATH"] = ":".join(system_paths + [original_pythonpath])
-
+        # If venv_path is provided, use its bin directory in PATH and its Python
+        if venv_path:
+            venv_bin = os.path.join(venv_path, "bin")
+            modified_env["PATH"] = venv_bin + os.pathsep + modified_env.get("PATH", "")
+            venv_python = get_venv_python_path(venv_path)
+        else:
+            venv_python = None
+        # Get system Python paths automatically if not using venv
+        if not venv_path:
+            system_paths = get_system_python_paths()
+            if not system_paths:
+                raise Exception("No system Python paths found")
+            modified_env["PYTHONPATH"] = ":".join(system_paths + [original_pythonpath])
         # Run the command with modified environment
-        # Only prepend python3 if the command appears to be a Python script
         if command.endswith(".py") or command.startswith("python"):
-            cmd = f"/usr/bin/python3 {command}"
+            if venv_python:
+                cmd = f"{venv_python} {command if command.endswith('.py') else ' '.join(command.split()[1:])}"
+            else:
+                cmd = f"/usr/bin/python3 {command}"
         else:
             cmd = command
-
         result = subprocess.run(
             cmd, shell=True, env=modified_env, capture_output=True, text=True
         )
-
         return result
-
     except Exception as e:
         print(f"Error: {e}")
         traceback.print_exc()
         return None
 
 
-def run_shell_command(command):
+def run_shell_command(command, venv_path=None):
+    """
+    Runs a shell command, optionally within a specified virtual environment.
+    Args:
+        command (str): The shell command to run.
+        venv_path (str, optional): Path to the virtual environment to use. Defaults to None.
+    Returns:
+        subprocess.CompletedProcess: The result of the command execution.
+    """
     try:
+        if venv_path:
+            # Use the venv-aware function
+            return run_shell_command_without_virtualenv(command, venv_path=venv_path)
         result = subprocess.run(command, shell=True, capture_output=True, text=True)
         if result.stderr:
             raise Exception(result.stderr)
-
         return result
-
     except Exception as e:
         print(e)
         traceback.print_exc()
         print(
             "Error in run_shell_command, running  run_shell_command_without_virtualenv"
         )
-        return run_shell_command_without_virtualenv(command)
+        return run_shell_command_without_virtualenv(command, venv_path=venv_path)
