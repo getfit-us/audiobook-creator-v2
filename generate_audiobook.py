@@ -244,31 +244,46 @@ async def parallel_post_processing(chapter_files, book_title, output_format):
     import concurrent.futures
 
     max_workers = min(4, len(chapter_files))
-    m4a_chapter_files = []
+    # Initialize list to store results in the correct order
+    m4a_chapter_files = [None] * len(chapter_files)
 
     post_processing_bar = tqdm(
         total=len(chapter_files), unit="chapter", desc="Post Processing (Parallel)"
     )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(process_single_chapter, chapter_file)
-            for chapter_file in chapter_files
-        ]
+    if not chapter_files:  # Handle empty list gracefully
+        post_processing_bar.close()
+        return []
 
-        for future in concurrent.futures.as_completed(futures):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Map futures to their original index to ensure order is preserved
+        future_to_index = {
+            executor.submit(process_single_chapter, chapter_files[i]): i
+            for i in range(len(chapter_files))
+        }
+
+        for future in concurrent.futures.as_completed(future_to_index):
+            original_index = future_to_index[future]
             try:
-                m4a_chapter_file = future.result()
-                m4a_chapter_files.append(m4a_chapter_file)
+                processed_m4a_file = future.result()
+                m4a_chapter_files[original_index] = processed_m4a_file
                 post_processing_bar.update(1)
             except Exception as e:
-                print(f"Error in post-processing: {e}")
+                # Log the specific chapter that failed if possible
+                failed_chapter_name = "unknown"
+                if original_index < len(chapter_files):
+                    failed_chapter_name = chapter_files[original_index]
+                print(
+                    f"Error in post-processing for chapter {failed_chapter_name}: {e}"
+                )
+                post_processing_bar.close()  # Ensure bar is closed on error
                 raise e
 
     post_processing_bar.close()
 
-    # Sort to maintain chapter order
-    m4a_chapter_files.sort()
+    # The m4a_chapter_files list is now populated in the correct order,
+    # so sorting is no longer needed.
+    # m4a_chapter_files.sort() # This line is removed
     return m4a_chapter_files
 
 
@@ -966,6 +981,9 @@ async def generate_audio_files(
     # Clean up temp line audio files
     shutil.rmtree(temp_line_audio_dir)
     yield "Cleaned up temporary files"
+
+    # create audiobook directory if it does not exist
+    os.makedirs(f"generated_audiobooks", exist_ok=True)
 
     if generate_m4b_audiobook_file:
         # Merge all chapter files into a final m4b audiobook
