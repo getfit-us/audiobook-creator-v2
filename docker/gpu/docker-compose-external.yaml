@@ -1,0 +1,22 @@
+version: "3.8"
+
+services:
+  audiobook_creator:
+    build:
+      context: ../..
+      dockerfile: docker/gpu/Dockerfile
+    container_name: audiobook_creator
+    volumes:
+      - ../..:/app
+      - ../../model_cache:/app/model_cache
+    env_file:
+      - ../../.env
+    restart: always
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

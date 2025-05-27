@@ -16,10 +16,4 @@ services:
     ports:
       - "7860:7860"
 
-  # fastapi:
-  #   image: ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2 # Use CPU version
-  #   container_name: service
-  #   restart: always
-  #   network_mode: host
-  #   command: >
-  #     uvicorn api.src.main:app --host 0.0.0.0 --port 8880 --log-level debug --workers 1
+

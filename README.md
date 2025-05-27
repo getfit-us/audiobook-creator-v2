@@ -186,10 +186,10 @@ Watch the demo video:
     cd docker/gpu
 
     # To include Kokoro TTS service
-    docker compose --profile kokoro up --build
+    docker compose -f docker-compose-kokoro.yml up
 
     # To run without TTS service (if using external TTS)
-    docker compose up --build
+    docker compose -f docker-compose-external.yml up
     ```
 
     For CPU based inference. In this case you can keep number of workers as 1 as only mostly GPU based inferencing benefits from parallel workers and batch requests.
