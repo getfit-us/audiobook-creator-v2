@@ -56,7 +56,7 @@ from utils.task_utils import (
     get_task_progress_index,
     set_task_progress_index,
 )
-from utils.tts_api import generate_tts_with_retry
+from utils.tts_api import generate_tts_with_retry, select_tts_voice
 
 load_dotenv()
 
@@ -998,9 +998,7 @@ async def generate_audio_files(
     concatenate_chapters(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
-    post_processing_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Adding Silence"
-    )
+  
 
     # Optimized parallel post-processing
     yield "Starting parallel post-processing..."
@@ -1044,16 +1042,7 @@ async def process_audiobook_generation(
     task_id=None,
 ):
     # Select narrator voice string based on narrator_gender and MODEL
-    if narrator_gender == "male":
-        if MODEL == "kokoro":
-            narrator_voice = "am_puck"
-        else:
-            narrator_voice = "leo"
-    else:
-        if MODEL == "kokoro":
-            narrator_voice = "af_heart"
-        else:
-            narrator_voice = "tara"
+    narrator_voice = select_tts_voice(MODEL, narrator_gender)
 
     is_tts_api_up, message = await check_tts_api(
         async_openai_client, MODEL, narrator_voice

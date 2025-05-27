@@ -161,3 +161,17 @@ async def generate_tts_with_retry(
 
     # This should never be reached, but just in case
     raise Exception("Unexpected end of retry loop")
+
+
+def select_tts_voice(model, narrator_gender):
+    if narrator_gender == "male":
+        if model == "kokoro":
+            narrator_voice = "am_puck"
+        else:
+            narrator_voice = "leo"
+    else:
+        if model == "kokoro":
+            narrator_voice = "af_heart"
+        else:
+            narrator_voice = "tara"
+    return narrator_voice
