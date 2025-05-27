@@ -8,3 +8,5 @@ todo.md
 chapter_list.txt
 generation_tasks.json
 .*
+
+/test*
