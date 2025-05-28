@@ -486,6 +486,7 @@ async def identify_characters_and_output_book_to_jsonl(
 
 
 async def process_book_and_identify_characters(book_title):
+    converted_book_path = f"'{TEMP_DIR}/{book_title}/converted_book.txt'"
     is_llm_up, message = await check_if_llm_is_up(async_openai_client, model_name)
 
     if not is_llm_up:
@@ -495,7 +496,9 @@ async def process_book_and_identify_characters(book_title):
     protagonist = await find_book_protagonist(
         book_title, async_openai_client, model_name
     )
-    f = open(f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding="utf-8")
+    if not os.path.exists(converted_book_path):
+        raise Exception(f"Converted book not found at {converted_book_path}")
+    f = open(converted_book_path, "r", encoding="utf-8")
     book_text = f.read()
     yield f"Found protagonist: {protagonist}"
     await asyncio.sleep(1)
@@ -507,8 +510,12 @@ async def process_book_and_identify_characters(book_title):
 
 
 async def main(book_title: str):
-    f = open(f"{TEMP_DIR}/{book_title}/converted_book.txt", "r", encoding="utf-8")
+    converted_book_path = f"{TEMP_DIR}/{book_title}/converted_book.txt"
+    if not os.path.exists(converted_book_path):
+        raise Exception(f"Converted book not found at {converted_book_path}")
+    f = open(converted_book_path, "r", encoding="utf-8")
     book_text = f.read()
+    f.close()
 
     # Ask for the protagonist's name
     print("\n📖 **Character Identification Setup**")
