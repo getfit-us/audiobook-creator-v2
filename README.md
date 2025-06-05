@@ -40,7 +40,7 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
    - Offers two narration modes:
      - **Single-Voice**: Uses a single voice for narration and another voice for dialogues for the entire book.
      - **Multi-Voice**: Assigns different voices to characters based on their gender scores.
-   - Saves the audiobook in the selected output format to `generated_audiobooks/audiobook.{output_format}`.
+   - Saves the audiobook in the selected output format to `generated_audiobooks/book title.{output_format}`.
    </details>
 
 ## Key Features
@@ -85,16 +85,27 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
   **Option A: Kokoro TTS** via [Kokoro-FastAPI](https://github.com/remsky/Kokoro-FastAPI). To get started, run the docker image using the following command:
 
   For CUDA based GPU inference (Apple Silicon GPUs currently not supported, use CPU based inference instead). Choose the value of MAX_PARALLEL_REQUESTS_BATCH_SIZE based on [this guide](https://github.com/prakharsr/audiobook-creator/?tab=readme-ov-file#parallel-batch-inferencing-of-audio-for-faster-audio-generation)
+  If you are going to use a modified max parallel request batch size, it is best to git clone the [repo](https://github.com/remsky/Kokoro-FastAPI.git).
+  ```
+   git clone https://github.com/remsky/Kokoro-FastAPI.git &&
+   cd Kokoro-FastAPI &&
+   nano docker/scripts/entrypoint.sh
+  
+  
+  ```
+  Add the number of workers to the end of the command. 
+  **Example**: exec uv run --extra $DEVICE --no-sync python -m uvicorn api.src.main:app --host 0.0.0.0 --port 8880 --log-level debug --workers 2
+
 
   ```bash
  
-docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest  
+   docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest  
   ```
 
   For CPU based inference. In this case you can keep number of workers as 1 as only mostly GPU based inferencing benefits from parallel workers and batch requests.
 
   ```bash
- docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest 
+    docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest 
   ```
 
   **Option B: Orpheus TTS** via [Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI). Orpheus offers high-performance TTS with emotion tags and 8 different voices. To get started:
@@ -141,7 +152,7 @@ docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest
   - Copy the .env file into the audiobook-creator folder
   - Choose between the types of inference:
 
-    For CUDA based GPU inference (Apple Silicon GPUs currently not supported, use CPU based inference instead). Choose the value of MAX_PARALLEL_REQUESTS_BATCH_SIZE based on [this guide](https://github.com/prakharsr/audiobook-creator/?tab=readme-ov-file#parallel-batch-inferencing-of-audio-for-faster-audio-generation) and set the value in fastapi service and env variable.
+    For CUDA based GPU inference (Apple Silicon GPUs currently not supported, use CPU based inference instead). Choose the value of MAX_PARALLEL_REQUESTS_BATCH_SIZE based on [this guide](https://github.com/getfit-us/audiobook-creator-v2/?tab=readme-ov-file#parallel-batch-inferencing-of-audio-for-faster-audio-generation) and set the value in fastapi service and env variable.
 
     ```bash
     cd docker/gpu
