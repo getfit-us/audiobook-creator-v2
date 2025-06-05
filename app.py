@@ -38,7 +38,7 @@ from book_to_txt import process_book_and_extract_text, save_book
 from identify_characters_and_output_book_to_jsonl import (
     process_book_and_identify_characters,
 )
-from generate_audiobook import process_audiobook_generation
+from generate_audiobook import process_audiobook_generation, generate_audiobook_background
 from utils.task_utils import (
     get_active_tasks,
     get_past_generated_files,
@@ -422,59 +422,114 @@ async def generate_audiobook_wrapper(
             },
         )
 
-        # Register the current task for cancellation
+        # Create a background task that will continue even if UI disconnects
+        async def background_audiobook_generation():
+            """Background task that continues audiobook generation even if UI disconnects"""
+            try:
+                # Determine voice type for the background function
+                voice_mode = "multi_voice" if voice_type == "Multi-Voice" else "single_voice"
+                
+                # Run the background generation without any yield statements
+                await generate_audiobook_background(
+                    output_format.lower(),
+                    narrator_gender,
+                    safe_book_file,
+                    book_title,
+                    voice_mode,
+                    task_id,
+                )
+                
+            except asyncio.CancelledError:
+                update_task_status(task_id, "cancelled", "Task was cancelled by user")
+                raise
+            except Exception as e:
+                update_task_status(task_id, "failed", "Generation failed", str(e))
+                print(f"Background generation error: {e}")
+                traceback.print_exc()
+                raise
+            finally:
+                unregister_running_task(task_id)
+
+        # Start the background task
         import asyncio
-
-        current_task = asyncio.current_task()
-        register_running_task(task_id, current_task)
-
+        background_task = asyncio.create_task(background_audiobook_generation())
+        
+        # Register the background task for cancellation instead of current task
+        register_running_task(task_id, background_task)
+        
         last_output = None
         audiobook_path = None
-        # Pass through all yield values from the original function
-        async for output in process_audiobook_generation(
-            voice_type,
-            narrator_gender,
-            output_format,
-            safe_book_file,
-            book_title,
-            task_id,
-        ):
-            last_output = output
-            # Update task status with current progress
-            update_task_status(task_id, "running", output)
-            yield output, None  # Yield each progress update without file path
-
-        # Construct the expected audiobook file path
-        audiobook_filename = f"{book_title}.{output_format.lower()}"
-        audiobook_path = os.path.join("generated_audiobooks", audiobook_filename)
+        ui_disconnected = False
         
-        # Verify the file exists before returning it
-        if not os.path.exists(audiobook_path):
-            audiobook_path = None
+        # Try to provide UI updates, but continue background task if UI disconnects
+        try:
+            # Provide initial progress updates while UI is connected
+            while not background_task.done():
+                try:
+                    # Check task status and yield progress
+                    tasks = load_tasks()
+                    if task_id in tasks:
+                        current_progress = tasks[task_id].get("progress", "Processing...")
+                        last_output = current_progress
+                        yield current_progress, None
+                    
+                    # Wait a bit before next update
+                    await asyncio.sleep(2)
+                    
+                except (GeneratorExit, StopAsyncIteration):
+                    # UI has disconnected, but let background task continue
+                    print(f"[DEBUG] UI disconnected for task {task_id}, but background generation continues...")
+                    ui_disconnected = True
+                    break
+                except Exception as e:
+                    print(f"[DEBUG] UI update error for task {task_id}: {e}, continuing background generation...")
+                    ui_disconnected = True
+                    break
+            
+            # Wait for background task to complete
+            if not ui_disconnected:
+                await background_task
+                
+        except (GeneratorExit, StopAsyncIteration):
+            # UI disconnected, but background task continues
+            print(f"[DEBUG] UI generator closed for task {task_id}, background generation continues...")
+            # Don't await the background task here, let it continue independently
+            
+        except Exception as e:
+            print(f"[DEBUG] UI error for task {task_id}: {e}, background generation continues...")
+            # Don't await the background task here, let it continue independently
 
-        # Mark task as completed
-        update_task_status(
-            task_id,
-            "completed",
-            f"Audiobook generated successfully: {book_title}.{output_format.lower()}",
-        )
+        # If UI is still connected, provide final status
+        if not ui_disconnected and background_task.done():
+            # Construct the expected audiobook file path
+            audiobook_filename = f"{book_title}.{output_format.lower()}"
+            audiobook_path = os.path.join("generated_audiobooks", audiobook_filename)
+            
+            # Verify the file exists before returning it
+            if not os.path.exists(audiobook_path):
+                audiobook_path = None
 
-        # Unregister the task
-        unregister_running_task(task_id)
-
-        # Final yield with success notification and file path
-        yield gr.Info(
-            f"Audiobook generated successfully in {output_format} format! You can now download it below.",
-            duration=15,
-        ), audiobook_path
-        yield last_output, audiobook_path
+            # Final yield with success notification and file path
+            try:
+                yield gr.Info(
+                    f"Audiobook generated successfully in {output_format} format! You can now download it below.",
+                    duration=15,
+                ), audiobook_path
+                yield last_output, audiobook_path
+            except (GeneratorExit, StopAsyncIteration):
+                print(f"[DEBUG] UI disconnected during final update for task {task_id}")
+                
         return
+        
     except asyncio.CancelledError:
         # Handle task cancellation
         update_task_status(task_id, "cancelled", "Task was cancelled by user")
         unregister_running_task(task_id)
-        yield gr.Warning("Audiobook generation was cancelled."), None
-        yield None, None
+        try:
+            yield gr.Warning("Audiobook generation was cancelled."), None
+            yield None, None
+        except (GeneratorExit, StopAsyncIteration):
+            pass
         return
     except Exception as e:
         # Mark task as failed
@@ -482,8 +537,11 @@ async def generate_audiobook_wrapper(
         unregister_running_task(task_id)
         print(e)
         traceback.print_exc()
-        yield gr.Warning(f"Error generating audiobook: {str(e)}"), None
-        yield None, None
+        try:
+            yield gr.Warning(f"Error generating audiobook: {str(e)}"), None
+            yield None, None
+        except (GeneratorExit, StopAsyncIteration):
+            pass
         return
 
 

@@ -62,6 +62,7 @@ from utils.tts_api import generate_tts_with_retry, select_tts_voice
 load_dotenv()
 
 
+
 os.makedirs("audio_samples", exist_ok=True)
 
 
@@ -434,6 +435,9 @@ async def generate_audio_files(
     if it is narration or dialogue, and generates corresponding audio using specified
     voices. The generated audio is organized by chapters, with options to create
     an M4B audiobook file or a standard audio file in the specified output format.
+
+    This function is primarily used for UI-connected generation. For background generation
+    that continues even if the UI disconnects, use generate_audiobook_background() instead.
 
     Args:
         output_format (str): The desired output format for the final audiobook (e.g., "mp3", "wav").
@@ -1068,7 +1072,472 @@ async def main(
     execution_time = end_time - start_time
     print(
         f"\n⏱️ **Execution Time:** {execution_time:.6f} seconds\n✅ Audiobook generation complete!"
+          )
+
+
+async def generate_audiobook_background(
+    output_format,
+    narrator_gender,
+    book_path="",
+    book_title="audiobook",
+    type="single_voice",
+    task_id=None,
+):
+    """
+    Generate an audiobook in the background without any yield statements.
+    This function is designed to run independently and continue even if the UI disconnects.
+    Progress is tracked only through task status updates.
+    """
+    # Check if converted book exists, if not, process the book first
+    converted_book_path = f"{TEMP_DIR}/{book_title}/converted_book.txt"
+    if not os.path.exists(converted_book_path):
+        if task_id:
+            update_task_status(task_id, "running", "Converting book to text format...")
+        
+        # Import and use the book processing function
+        from book_to_txt import process_book_and_extract_text
+
+        # Create the temp directory structure
+        os.makedirs(f"{TEMP_DIR}/{book_title}", exist_ok=True)
+
+        # Process the book and extract text
+        for text in process_book_and_extract_text(book_path, "textract", book_title):
+            pass 
+            
+        if task_id:
+            update_task_status(task_id, "running", "Book conversion completed")
+
+    lines_to_process = []
+
+    # Import the improved voice selection utilities
+    from utils.select_voice import select_voice
+
+    # Setup for multi-voice lines
+    character_gender_map = None
+    voice_map = None
+    narrator_voice = ""
+    dialogue_voice = ""
+    
+    if type.lower() == "multi_voice":
+        print(f"Processing multi-voice lines")
+
+        try:
+            voice_config = select_voice(narrator_gender, TTS_MODEL, "multi_voice", book_title)
+            speaker_file_path = voice_config["speaker_file_path"]
+            narrator_voice = voice_config["narrator_voice"]
+            
+            # Load character gender map and voice map once for multi-voice mode
+            with open(voice_config["character_map_path"], "r", encoding="utf-8") as f:
+                character_gender_map = json.load(f)
+            with open(voice_config["voice_map_path"], "r", encoding="utf-8") as f:
+                voice_map = json.load(f)
+            
+            with open(speaker_file_path, "r", encoding="utf-8") as file:
+                for line in file:
+                    # Parse each line as a JSON object
+                    json_object = json.loads(line.strip())
+                    # Append the parsed JSON object to the array
+                    lines_to_process.append(json_object)
+
+            if task_id:
+                update_task_status(task_id, "running", "Loaded speaker-attributed lines from JSONL file")
+
+        except (FileNotFoundError, ValueError) as e:
+            if task_id:
+                update_task_status(task_id, "failed", f"Error: {str(e)}")
+            raise e
+
+        total_lines = len(lines_to_process)
+
+        if task_id:
+            update_task_status(task_id, "running", "Loaded voice mappings and selected narrator voice")
+
+    else:
+        # handle single voice
+        try:
+            voice_config = select_voice(narrator_gender, TTS_MODEL, "single_voice", book_title)
+            narrator_voice = voice_config["narrator_voice"]
+            dialogue_voice = voice_config["dialogue_voice"]
+            
+            with open(converted_book_path, "r", encoding="utf-8") as f:
+                text = f.read()
+                lines_to_process = text.split("\n")
+                lines_to_process = [line.strip() for line in lines_to_process if line.strip()]
+
+        except (FileNotFoundError, ValueError) as e:
+            if task_id:
+                update_task_status(task_id, "failed", f"Error: {str(e)}")
+            raise e
+
+        total_lines = len(lines_to_process)
+
+    # Setup directories
+    temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
+
+    # restart from the last line if the directory exists or create a new directory
+    if os.path.exists(temp_line_audio_dir):
+        resume_index, _ = get_task_progress_index(task_id)
+        print(f"Resuming from line {resume_index}")
+    else:
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        empty_directory(os.path.join(temp_line_audio_dir, book_title))
+        os.makedirs(temp_line_audio_dir, exist_ok=True)
+
+    # Batch processing parameters
+    semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS_BATCH_SIZE)
+    print(f"Starting task {task_id}")
+
+    # Initial setup for chapters
+    chapter_index = 1
+
+    current_chapter_audio = "Introduction.m4a"
+    chapter_files = []
+    resume_index = 0
+    if task_id:
+        resume_index, _ = get_task_progress_index(task_id)
+        print(f"Resuming from line {resume_index}")
+
+    progress_counter = 0
+    progress_lock = asyncio.Lock()  
+
+    progress_bar = tqdm(
+        total=total_lines, unit="line", desc="Audio Generation Progress"
     )
+
+    # Maps chapters to their line indices
+    chapter_line_map = {}
+
+    async def update_progress_and_task_status(
+        line_index,
+        actual_text_content,
+    ):
+        nonlocal progress_counter
+        async with progress_lock:
+            progress_bar.update(1)
+            progress_counter = progress_counter + 1
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {progress_counter}/{total_lines}",
+            )
+            set_task_progress_index(task_id, progress_counter, total_lines)
+
+            return {
+                "index": line_index,
+                "is_chapter_heading": check_if_chapter_heading(actual_text_content),
+                "line": actual_text_content,  # Return the processed text content
+            }
+
+    async def process_single_line(
+        line_index,
+        line, 
+        type="single_voice",
+    ):
+        async with semaphore:
+            nonlocal progress_counter
+
+            actual_text_content = ""
+            speaker_name = ""
+
+            if type.lower() == "multi_voice":
+                actual_text_content = line.get("line", "").strip()
+                speaker_name = line.get("speaker", "").strip()
+            else:  
+                actual_text_content = str(line).strip()
+
+            annotated_parts = split_and_annotate_text(actual_text_content)
+            audio_parts = []
+            line_audio_path = os.path.join(
+                temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
+            )
+            # if the line audio file exists and is not empty, we can skip the line
+            if (
+                os.path.exists(line_audio_path)
+                and os.path.getsize(line_audio_path) > 1024
+            ):
+                return await update_progress_and_task_status(
+                    line_index, actual_text_content
+                )
+
+            try:
+                for i, part in enumerate(annotated_parts):
+                    text_to_speak = part["text"].strip()
+
+                    if task_id and is_task_cancelled(task_id):
+                        print(
+                            f"[DEBUG] Task {task_id} cancelled before processing line {line_index}, part {i}"
+                        )
+                        raise asyncio.CancelledError("Task was cancelled by user")
+
+                    if TTS_MODEL == "orpheus":
+                        # add full stops where necessary
+                        text_to_speak = preprocess_text_for_orpheus(text_to_speak)
+
+                    voice = ""
+                    if type.lower() == "multi_voice":
+                        # For multi-voice mode, use speaker-based voice selection
+                        if speaker_name and speaker_name.lower() == "narrator":
+                            voice = narrator_voice
+                        elif speaker_name and character_gender_map and voice_map:
+                            voice = find_voice_for_gender_score(speaker_name, character_gender_map, voice_map)
+                        else:
+                            # Fallback to narrator voice if speaker not found
+                            voice = narrator_voice
+                            print(f"[DEBUG] Using narrator voice fallback for speaker: {speaker_name}")
+                    else:
+                        # For single-voice mode, use narration/dialogue logic
+                        if part["type"] == "narration":
+                            voice = narrator_voice
+                        else:
+                            voice = dialogue_voice
+
+                    try:
+
+                        current_part_audio_buffer = await generate_tts_with_retry(
+                            TTS_MODEL,
+                            voice,  
+                            text_to_speak,
+                            API_OUTPUT_FORMAT,
+                            speed=0.85,
+                            max_retries=5,
+                            task_id=task_id,
+                        )
+
+                        part_file_path = os.path.join(
+                            temp_line_audio_dir,
+                            f"line_{line_index:06d}_part_{i}.{API_OUTPUT_FORMAT}",
+                        )
+
+                        with open(part_file_path, "wb") as part_file:
+                            part_file.write(current_part_audio_buffer)
+                        audio_parts.append(part_file_path)
+                        print(
+                            f"[DEBUG] Created part file: {part_file_path} ({len(current_part_audio_buffer)} bytes)"
+                        )
+                    except asyncio.CancelledError:
+                        # Clean up any created files and remove final line file before re-raising
+                        for part_file in audio_parts:
+                            if os.path.exists(part_file):
+                                os.remove(part_file)
+                        if os.path.exists(line_audio_path):
+                            os.remove(line_audio_path)
+                        raise
+                    except Exception as e:
+
+                        # Clean up any created files and remove final line file before re-raising
+                        for part_file in audio_parts:
+                            if os.path.exists(part_file):
+                                os.remove(part_file)
+                        if os.path.exists(line_audio_path):
+                            os.remove(line_audio_path)
+                        raise e
+
+            except Exception as e:
+                # Clean up any created files and remove final line file before re-raising
+                for part_file in audio_parts:
+                    if os.path.exists(part_file):
+                        os.remove(part_file)
+                if os.path.exists(line_audio_path):
+                    os.remove(line_audio_path)
+                print(f"ERROR processing line {line_index}: {e}")
+                raise e
+
+            if audio_parts:
+                concatenate_wav_files(audio_parts, line_audio_path)
+                # Clean up individual part files after successful concatenation
+                for part_file in audio_parts:
+                    if os.path.exists(part_file):
+                        os.remove(part_file)
+                        print(f"[DEBUG] Cleaned up part file: {part_file}")
+            else:
+                print(f"WARNING: Line {line_index} resulted in no valid audio parts.")
+                # Create an empty file to mark this line as processed
+                with open(line_audio_path, "wb") as f:
+                    f.write(b"")
+
+            return await update_progress_and_task_status(
+                line_index, actual_text_content
+            )
+
+    # Create tasks and store them with their index for result collection
+    tasks = []
+    task_to_index = {}
+    for i, line_content in enumerate(lines_to_process):  # Iterate over lines_to_process
+        if i < resume_index:
+            # Already processed, skip
+            continue
+
+        task = asyncio.create_task(
+            process_single_line(i, line_content, type)
+        )  # Pass line_content
+        tasks.append(task)
+        task_to_index[task] = i
+
+    # Initialize results_all list
+    results_all = [None] * total_lines  
+
+    # Create a cancellation monitor task
+    async def cancellation_monitor():
+        while tasks:
+            await asyncio.sleep(0.5)  # Check every 500ms
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Cancellation monitor detected task {task_id} is cancelled"
+                )
+                # Cancel all remaining tasks
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(f"[DEBUG] Cancellation monitor cancelled a task")
+                # clean up the temp directory
+                temp_book_dir = f"{TEMP_DIR}/{book_title}"
+                if os.path.exists(temp_book_dir):
+                    try:
+                        shutil.rmtree(temp_book_dir)
+                        print(f"[DEBUG] Cleaned up temp directory: {temp_book_dir}")
+                    except Exception as e:
+                        print(f"[DEBUG] Error cleaning up temp directory: {e}")
+                break
+
+    # Start the cancellation monitor
+    monitor_task = asyncio.create_task(cancellation_monitor())
+
+    # Process tasks with progress updates and retry logic
+    last_reported = -1
+
+    while tasks:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Store results as tasks complete
+        for completed_task in done:
+            idx = task_to_index[completed_task]
+            results_all[idx] = completed_task.result()
+
+        tasks = list(pending)
+
+        # Only update if the counter has changed
+        if progress_counter > last_reported:
+            last_reported = progress_counter
+            percent = (progress_counter / total_lines) * 100
+
+            # Check if task has been cancelled
+            if task_id and is_task_cancelled(task_id):
+                print(
+                    f"[DEBUG] Task {task_id} was cancelled, cancelling all pending tasks"
+                )
+                # Cancel all pending tasks immediately
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                        print(f"[DEBUG] Cancelled pending task")
+                raise asyncio.CancelledError("Task was cancelled by user")
+
+            # update the task status
+            update_task_status(
+                task_id,
+                "generating",
+                f"Generating audiobook. Progress: {percent:.1f}%",
+            )
+
+    # All tasks have completed at this point and results_all is populated
+    results = [r for r in results_all if r is not None]  # Filter out empty lines
+
+    # Clean up the monitor task
+    if not monitor_task.done():
+        monitor_task.cancel()
+
+    progress_bar.update(total_lines)
+    progress_bar.close()
+
+    results = [r for r in results_all if r is not None]
+
+    if task_id:
+        update_task_status(task_id, "running", f"Completed generating audio for {len(results)}/{total_lines} lines")
+
+    # Validate all audio files exist before proceeding to concatenation
+    print("Validating audio files before concatenation...")
+    missing_files = []
+    for result in results:
+        line_idx = result["index"]
+        final_line_path = os.path.join(
+            temp_line_audio_dir,
+            f"line_{line_idx:06d}.{API_OUTPUT_FORMAT}",
+        )
+        if not os.path.exists(final_line_path) or os.path.getsize(final_line_path) == 0:
+            missing_files.append(line_idx)
+
+    if missing_files:
+        print(
+            f"ERROR: {len(missing_files)} audio files are missing or empty: {missing_files[:10]}..."
+        )
+        raise Exception(
+            f"Cannot proceed with concatenation - {len(missing_files)} audio files are missing"
+        )
+
+    print(f"✅ All {len(results)} audio files validated successfully")
+
+    # Second pass: Organize by chapters
+    chapter_organization_bar = tqdm(
+        total=len(results), unit="result", desc="Organizing Chapters"
+    )
+
+    for result in sorted(results, key=lambda x: x["index"]):
+        # Check if this is a chapter heading
+        if result["is_chapter_heading"]:
+            chapter_index += 1
+
+            # Always assemble chapters as M4A files first, regardless of final output format
+            current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
+
+        if current_chapter_audio not in chapter_files:
+            chapter_files.append(current_chapter_audio)
+            chapter_line_map[current_chapter_audio] = []
+
+        # Add this line index to the chapter
+        chapter_line_map[current_chapter_audio].append(result["index"])
+        chapter_organization_bar.update(1)
+
+    chapter_organization_bar.close()
+    
+    if task_id:
+        update_task_status(task_id, "running", "Organizing audio by chapters complete")
+    
+    # concatenate chapters into m4a files
+    chapter_files = concatenate_chapters(
+        chapter_files, book_title, chapter_line_map, temp_line_audio_dir
+    )
+    
+    if task_id:
+        update_task_status(task_id, "running", f"Completed concatenating {len(chapter_files)} chapters")
+
+    # Optimized parallel post-processing
+    if task_id:
+        update_task_status(task_id, "running", "Starting parallel post-processing...")
+    
+    chapter_files = await parallel_post_processing(
+        chapter_files, book_title, output_format
+    )
+    
+    if task_id:
+        update_task_status(task_id, "running", f"Completed parallel post-processing of {len(chapter_files)} chapters")
+
+    # create audiobook directory if it does not exist
+    os.makedirs(f"generated_audiobooks", exist_ok=True)
+
+    if task_id:
+        update_task_status(task_id, "running", "Creating final audiobook...")
+    
+    if output_format == "m4b":
+        merge_chapters_to_m4b(book_path, chapter_files, book_title)
+    else:
+        merge_chapters_to_standard_audio_file(chapter_files, book_title)
+    # convert to final output format
+        convert_audio_file_formats(
+        "m4a", output_format, "generated_audiobooks", book_title
+        )
+
+    if task_id:
+        update_task_status(task_id, "completed", f"Audiobook in {output_format} format created successfully")
 
 
 if __name__ == "__main__":
