@@ -93,17 +93,25 @@ def save_tasks(tasks):
 def update_task_status(task_id, status, progress="", error=None, params=None):
     """Update task status and optionally store parameters"""
     tasks = load_tasks()
+    existing_task = tasks.get(task_id, {})
+    
+    # Preserve existing progress if no new progress is provided and we're marking as failed/cancelled
+    if not progress and status in ["failed", "cancelled"] and existing_task.get("progress"):
+        progress = existing_task.get("progress", "")
+        print(f"[DEBUG] Preserving progress for {status} task: {progress}")
+    
     if task_id in tasks:
         # Merge params if already present
         if params:
             old_params = tasks[task_id].get("params", {})
             params = {**old_params, **params}
+    
     tasks[task_id] = {
         "status": status,
         "progress": progress,
         "timestamp": datetime.now().isoformat(),
         "error": error,
-        "params": params or tasks.get(task_id, {}).get("params", {}),
+        "params": params or existing_task.get("params", {}),
     }
     save_tasks(tasks)
 
@@ -168,7 +176,7 @@ def get_active_tasks():
             timestamp = datetime.fromisoformat(task_info["timestamp"])
             hours_old = (current_time - timestamp).total_seconds() / 3600
 
-            if task_info.get("status") in ["running", "starting", "generating"]:
+            if task_info.get("status") in ["running", "starting", "generating", "resuming", "failed"]:
                 # Check if task is still actually running (simple heuristic)
                 if hours_old < 5:  # 5 hours timeout (changed from minutes)
                     active_tasks.append(

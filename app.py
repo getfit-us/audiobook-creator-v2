@@ -31,6 +31,7 @@ import gradio as gr
 import os
 import traceback
 import shutil
+import asyncio
 
 from datetime import datetime
 from fastapi import FastAPI
@@ -443,7 +444,8 @@ async def generate_audiobook_wrapper(
                 update_task_status(task_id, "cancelled", "Task was cancelled by user")
                 raise
             except Exception as e:
-                update_task_status(task_id, "failed", "Generation failed", str(e))
+                # Don't overwrite progress when marking as failed - let update_task_status preserve it
+                update_task_status(task_id, "failed", "", str(e))
                 print(f"Background generation error: {e}")
                 traceback.print_exc()
                 raise
@@ -451,7 +453,6 @@ async def generate_audiobook_wrapper(
                 unregister_running_task(task_id)
 
         # Start the background task
-        import asyncio
         background_task = asyncio.create_task(background_audiobook_generation())
         
         # Register the background task for cancellation instead of current task
@@ -638,6 +639,94 @@ def cancel_task_wrapper(task_id):
     except Exception as e:
         print(f"Error cancelling task: {e}")
         return gr.Warning(f"Error cancelling task: {str(e)}")
+
+
+async def continue_task_wrapper(task_id):
+    """Wrapper for continuing/resuming a stuck task"""
+    if not task_id:
+        return gr.Warning("No task selected for continuation.")
+
+    try:
+        tasks = load_tasks()
+        if task_id not in tasks:
+            return gr.Warning(f"Task {task_id} not found.")
+        
+        task_info = tasks[task_id]
+        params = task_info.get("params", {})
+        
+        # Extract parameters from the original task
+        voice_type = params.get("voice_type", "Single Voice")
+        narrator_gender = params.get("narrator_gender", "female")
+        output_format = params.get("output_format", "m4b")
+        book_file = params.get("book_file", "")
+        book_title = params.get("book_title", "audiobook")
+        
+        if not all([voice_type, narrator_gender, output_format, book_file, book_title]):
+            return gr.Warning("Incomplete task parameters. Cannot resume task.")
+        
+        # Debug: Check current progress before resuming
+        from utils.task_utils import get_task_progress_index
+        current_progress, total_lines = get_task_progress_index(task_id)
+        print(f"[DEBUG] Resuming task {task_id}: current progress {current_progress}/{total_lines}")
+        print(f"[DEBUG] Task info: {task_info}")
+        
+        # Check if we're very close to completion and should skip to assembly
+        if total_lines > 0 and current_progress >= total_lines - 5:  # Within 5 lines of completion
+            print(f"[DEBUG] Task {task_id} is near completion ({current_progress}/{total_lines}), proceeding to assembly phase")
+            update_task_status(
+                task_id,
+                "running",
+                f"Near completion, proceeding to audio assembly for '{book_title}'"
+            )
+        else:
+            # Update task status to indicate it's being resumed
+            update_task_status(
+                task_id,
+                "resuming",
+                f"Resuming {voice_type} audiobook generation for '{book_title}' from line {current_progress}/{total_lines}"
+            )
+        
+        # Start the background task again with the same parameters        
+        async def resume_background_generation():
+            """Resume the background audiobook generation"""
+            try:
+                voice_mode = "multi_voice" if voice_type == "Multi-Voice" else "single_voice"
+                
+                await generate_audiobook_background(
+                    output_format.lower(),
+                    narrator_gender,
+                    book_file,
+                    book_title,
+                    voice_mode,
+                    task_id,
+                )
+                
+            except asyncio.CancelledError:
+                update_task_status(task_id, "cancelled", "Task was cancelled by user")
+                raise
+            except Exception as e:
+                # Don't overwrite progress when marking as failed - let update_task_status preserve it
+                update_task_status(task_id, "failed", "", str(e))
+                print(f"Resume generation error: {e}")
+                traceback.print_exc()
+                raise
+            finally:
+                unregister_running_task(task_id)
+
+        # Start the resume task
+        try:
+            background_task = asyncio.create_task(resume_background_generation())
+            register_running_task(task_id, background_task)
+            print(f"[DEBUG] Successfully created resume task for {task_id}")
+            return gr.Info(f"Task resumed: {task_id}", duration=5)
+        except Exception as e:
+            print(f"[ERROR] Failed to create resume task: {e}")
+            return gr.Warning(f"Failed to create resume task: {str(e)}")
+        
+    except Exception as e:
+        print(f"Error continuing task: {e}")
+        traceback.print_exc()
+        return gr.Warning(f"Error continuing task: {str(e)}")
 
 
 def load_current_settings():
@@ -970,16 +1059,18 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 elem_id="temp-files-info"
             )
 
-            # Task cancellation section
+            # Task management section
             with gr.Group(visible=False) as cancel_task_group:
-                gr.Markdown("### ⏹️ Stop Running Task")
+                gr.Markdown("### ⏹️ Manage Running Tasks")
                 active_tasks_dropdown = gr.Dropdown(
-                    label="Select task to stop",
+                    label="Select task to manage",
                     choices=[],
                     visible=True,
                     interactive=True,
                 )
-                cancel_task_btn = gr.Button("⏹️ Stop Task", variant="stop", size="sm")
+                with gr.Row():
+                    cancel_task_btn = gr.Button("⏹️ Stop Task", variant="stop", size="sm")
+                    continue_task_btn = gr.Button("▶️ Continue Task", variant="primary", size="sm")
 
             past_files_display = gr.Markdown(
                 value="Click refresh to see generated audiobooks.", visible=True
@@ -1163,6 +1254,24 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         outputs=[],
     ).then(
         # Refresh the display after cancelling task
+        refresh_past_files_with_continue,
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+            
+        ],
+    )
+
+    # Continue task when the continue button is clicked
+    continue_task_btn.click(
+        continue_task_wrapper,
+        inputs=[active_tasks_dropdown],
+        outputs=[],
+    ).then(
+        # Refresh the display after continuing task
         refresh_past_files_with_continue,
         outputs=[
             past_files_display,

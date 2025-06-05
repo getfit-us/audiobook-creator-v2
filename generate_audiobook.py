@@ -620,6 +620,11 @@ async def generate_audio_files(
                 for i, part in enumerate(annotated_parts):
                     text_to_speak = part["text"].strip()
 
+                    # Skip empty text parts after stripping
+                    if not text_to_speak or len(text_to_speak) < 2:
+                        print(f"[DEBUG] Skipping empty text part {i} for line {line_index}")
+                        continue
+
                     if task_id and is_task_cancelled(task_id):
                         print(
                             f"[DEBUG] Task {task_id} cancelled before processing line {line_index}, part {i}"
@@ -1175,9 +1180,30 @@ async def generate_audiobook_background(
     temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
     # restart from the last line if the directory exists or create a new directory
+    resume_index = 0
     if os.path.exists(temp_line_audio_dir):
-        resume_index, _ = get_task_progress_index(task_id)
-        print(f"Resuming from line {resume_index}")
+        resume_index, total_expected = get_task_progress_index(task_id)
+        print(f"Resuming from line {resume_index}/{total_expected}")
+        
+        # Check if we're very close to completion - count existing files
+        if resume_index >= total_lines - 10:  # Within 10 lines of completion
+            existing_files = 0
+            for i in range(total_lines):
+                line_audio_path = os.path.join(
+                    temp_line_audio_dir, f"line_{i:06d}.{API_OUTPUT_FORMAT}"
+                )
+                if os.path.exists(line_audio_path) and os.path.getsize(line_audio_path) > 1024:
+                    existing_files += 1
+            
+            print(f"[DEBUG] Found {existing_files}/{total_lines} existing audio files")
+            
+            # If we have most files (allowing for a few failures), proceed to assembly
+            if existing_files >= total_lines - 5:
+                print(f"[DEBUG] Sufficient audio files exist ({existing_files}/{total_lines}), proceeding to assembly phase")
+                if task_id:
+                    update_task_status(task_id, "running", f"Audio generation nearly complete ({existing_files}/{total_lines}), proceeding to assembly")
+                # Set resume_index to total_lines to skip the generation loop entirely
+                resume_index = total_lines
     else:
         os.makedirs(TEMP_DIR, exist_ok=True)
         empty_directory(os.path.join(temp_line_audio_dir, book_title))
@@ -1262,6 +1288,11 @@ async def generate_audiobook_background(
             try:
                 for i, part in enumerate(annotated_parts):
                     text_to_speak = part["text"].strip()
+
+                    # Skip empty text parts after stripping
+                    if not text_to_speak or len(text_to_speak) < 2:
+                        print(f"[DEBUG] Skipping empty text part {i} for line {line_index}")
+                        continue
 
                     if task_id and is_task_cancelled(task_id):
                         print(

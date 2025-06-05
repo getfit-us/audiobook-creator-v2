@@ -612,7 +612,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
 
     # Optimized FFmpeg command with threading and better performance
     ffmpeg_cmd = (
-        f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
+        f'ffmpeg -y -f concat -safe 0 -i "{file_list_path}" -i "{cover_image}" -i "{chapters_file}" '
         f"-c:a copy -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 "
         f'-avoid_negative_ts make_zero -fflags +genpts -threads 0 {metadata} "{output_m4b}"'
     )
@@ -624,7 +624,7 @@ def merge_chapters_to_m4b(book_path, chapter_files, book_title="audiobook"):
         # Fallback to re-encoding if copy fails
         print("Copy codec failed for M4B, falling back to re-encoding...")
         ffmpeg_cmd = (
-            f'ffmpeg -y -f concat -safe 0 -i {file_list_path} -i "{cover_image}" -i "{chapters_file}" '
+            f'ffmpeg -y -f concat -safe 0 -i "{file_list_path}" -i "{cover_image}" -i "{chapters_file}" '
             f"-c:a aac -b:a 256k -c:v copy -map 0:a -map 1:v -disposition:v:0 attached_pic -map_metadata 2 "
             f'-avoid_negative_ts make_zero -fflags +genpts -threads 0 {metadata} "{output_m4b}"'
         )
@@ -733,7 +733,7 @@ def merge_chapters_to_standard_audio_file(chapter_files, book_title="audiobook")
     except subprocess.CalledProcessError:
         # Fallback to re-encoding if copy fails
         print("Copy codec failed, falling back to re-encoding...")
-        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{file_list_path}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
+        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{abs_chapter_list_path}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_file}"'
         subprocess.run(ffmpeg_cmd, shell=True, check=True)
 
     return book_title 
