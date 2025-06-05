@@ -28,6 +28,7 @@ import time
 import sys
 from config.constants import (
     API_KEY,
+    API_OUTPUT_FORMAT,
     BASE_URL,
     MODEL,
     MAX_PARALLEL_REQUESTS_BATCH_SIZE,
@@ -38,13 +39,12 @@ from utils.run_shell_commands import (
     check_if_ffmpeg_is_installed,
     check_if_calibre_is_installed,
 )
-from utils.file_utils import concatenate_audio_files, read_json, empty_directory
+from utils.file_utils import  concatenate_wav_files,  empty_directory
 from utils.audiobook_utils import (
     add_silence_to_audio_file_by_appending_silence_file,
     merge_chapters_to_m4b,
     convert_audio_file_formats,
     merge_chapters_to_standard_audio_file,
-    add_silence_to_audio_file_by_appending_pre_generated_silence,
 )
 from utils.check_tts_api import check_tts_api
 from dotenv import load_dotenv
@@ -61,13 +61,9 @@ from utils.tts_api import generate_tts_with_retry, select_tts_voice
 load_dotenv()
 
 
-API_OUTPUT_FORMAT = "wav" if MODEL == "orpheus" else "aac"
-
 os.makedirs("audio_samples", exist_ok=True)
 
 async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
-
-print(BASE_URL)
 
 
 def sanitize_filename(text):
@@ -142,17 +138,18 @@ def concatenate_chapters(
 ):
     """
     Concatenates the chapters into a single audiobook file.
+    Returns a list of full paths to the assembled chapter audio files.
     """
     # Third pass: Concatenate audio files for each chapter in order
     chapter_assembly_bar = tqdm(
         total=len(chapter_files), unit="chapter", desc="Assembling Chapters"
     )
 
-    def assemble_single_chapter(chapter_file):
+    def assemble_single_chapter(chapter_filename_simple):  # Renamed for clarity
         # Create a temporary file list for this chapter's lines
         chapter_lines_list = os.path.join(
             f"{TEMP_DIR}/{book_title}",
-            f"chapter_lines_list_{chapter_file.replace('/', '_').replace('.', '_')}.txt",
+            f"chapter_lines_list_{chapter_filename_simple.replace('/', '_').replace('.', '_')}.txt",
         )
 
         # Delete the chapter_lines_list file if it exists
@@ -160,125 +157,132 @@ def concatenate_chapters(
             os.remove(chapter_lines_list)
 
         with open(chapter_lines_list, "w", encoding="utf-8") as f:
-            for line_index in sorted(chapter_line_map[chapter_file]):
+            for line_index in sorted(chapter_line_map[chapter_filename_simple]):
                 line_audio_path = os.path.join(
                     temp_line_audio_dir, f"line_{line_index:06d}.{API_OUTPUT_FORMAT}"
                 )
                 # Use absolute path to prevent path duplication issues
                 f.write(f"file '{os.path.abspath(line_audio_path)}'\n")
 
-        # Use FFmpeg to concatenate the lines with optimized parameters
-        if MODEL == "orpheus":
-            # For Orpheus, convert WAV segments to M4A chapters directly with timestamp filtering
-            ffmpeg_cmd = (
-                f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" '
-                f'-c:a aac -b:a 256k -ar 44100 -ac 2 -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
-            )
-        else:
-            # For other models, use re-encoding with timestamp filtering to prevent truncation
-            ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{TEMP_DIR}/{book_title}/{chapter_file}"'
+        output_chapter_full_path = os.path.join(
+            TEMP_DIR, book_title, chapter_filename_simple
+        )
+
+        # Convert WAV input files to M4A output using AAC codec
+        ffmpeg_cmd = f'ffmpeg -y -f concat -safe 0 -i "{chapter_lines_list}" -c:a aac -b:a 256k -avoid_negative_ts make_zero -fflags +genpts -threads 0 "{output_chapter_full_path}"'
 
         try:
             result = subprocess.run(
                 ffmpeg_cmd, shell=True, check=True, capture_output=True, text=True
             )
-            print(f"[DEBUG] FFmpeg stdout: {result.stdout}")
-            print(f"[DEBUG] FFmpeg stderr: {result.stderr}")
+            # print(f"[DEBUG] FFmpeg stdout: {result.stdout}") # Usually too verbose
+            # print(f"[DEBUG] FFmpeg stderr: {result.stderr}") # Usually too verbose unless debugging
         except subprocess.CalledProcessError as e:
-            print(f"[ERROR] FFmpeg failed for {chapter_file}:")
+            print(f"[ERROR] FFmpeg failed for {chapter_filename_simple}:")
             print(f"[ERROR] Command: {ffmpeg_cmd}")
             print(f"[ERROR] Stdout: {e.stdout}")
             print(f"[ERROR] Stderr: {e.stderr}")
             raise e
 
-        print(f"Assembled chapter: {chapter_file}")
+        print(f"Assembled chapter: {output_chapter_full_path}") 
 
-        # Clean up the temporary file list
         os.remove(chapter_lines_list)
-        return chapter_file
+        return output_chapter_full_path  # Return the full path
 
-    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
+   
     import concurrent.futures
 
-    max_workers = min(4, len(chapter_files))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(assemble_single_chapter, chapter_file)
-            for chapter_file in chapter_files
-        ]
+    max_workers = min(
+        4, os.cpu_count() or 1, len(chapter_files)
+    )  
+    if (
+        max_workers == 0 and len(chapter_files) > 0
+    ):  
+        max_workers = 1
 
-        for future in concurrent.futures.as_completed(futures):
-            try:
-                chapter_file = future.result()
-                chapter_assembly_bar.update(1)
-            except Exception as e:
-                print(f"Error assembling chapter: {e}")
-                raise e
+    assembled_chapter_full_paths_ordered = [None] * len(chapter_files)
 
-    chapter_assembly_bar.close()
-
-
-async def parallel_post_processing(chapter_files, book_title, output_format):
-    """
-    Parallel post-processing of chapter files to add silence and convert formats.
-    """
-
-    print(
-        f"chapter_files: {chapter_files}, book_title: {book_title}, output_format: {output_format}"
-    )
-
-    def process_single_chapter(chapter_file):
-        # Add silence to chapter file
-
-        # Convert to M4A format if needed
-        chapter_name = chapter_file.split(f".{output_format}")[0]
-        m4a_chapter_file = f"{chapter_name}.m4a"
-
-        # Only convert if not already in M4A format
-        if not chapter_file.endswith(".m4a"):
-            convert_audio_file_formats(
-                output_format, "m4a", f"{TEMP_DIR}/{book_title}", chapter_name
-            )
-        else:
-            m4a_chapter_file = chapter_file
-
-        add_silence_to_audio_file_by_appending_silence_file(m4a_chapter_file)
-
-        return m4a_chapter_file
-
-    # Process chapters in parallel (limit to 4 concurrent to avoid overwhelming system)
-    import concurrent.futures
-
-    max_workers = min(4, len(chapter_files))
-    # Initialize list to store results in the correct order
-    m4a_chapter_files = [None] * len(chapter_files)
-
-    post_processing_bar = tqdm(
-        total=len(chapter_files), unit="chapter", desc="Post Processing (Parallel)"
-    )
-
-    if not chapter_files:  # Handle empty list gracefully
-        post_processing_bar.close()
+    if not chapter_files:  
+        chapter_assembly_bar.close()
         return []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Map futures to their original index to ensure order is preserved
         future_to_index = {
-            executor.submit(process_single_chapter, chapter_files[i]): i
+            executor.submit(assemble_single_chapter, chapter_files[i]): i
             for i in range(len(chapter_files))
         }
 
         for future in concurrent.futures.as_completed(future_to_index):
             original_index = future_to_index[future]
             try:
-                processed_m4a_file = future.result()
-                m4a_chapter_files[original_index] = processed_m4a_file
-                post_processing_bar.update(1)
+                processed_full_path = future.result()
+                assembled_chapter_full_paths_ordered[original_index] = (
+                    processed_full_path
+                )
+                chapter_assembly_bar.update(1)
             except Exception as e:
-                # Log the specific chapter that failed if possible
                 failed_chapter_name = "unknown"
                 if original_index < len(chapter_files):
                     failed_chapter_name = chapter_files[original_index]
+                print(f"Error assembling chapter {failed_chapter_name}: {e}")
+                chapter_assembly_bar.close()  
+                raise e
+
+    chapter_assembly_bar.close()
+    return assembled_chapter_full_paths_ordered 
+
+
+async def parallel_post_processing(chapter_full_paths, book_title, output_format):
+    """
+    Parallel post-processing of chapter files (given as full paths)
+    to add silence and convert formats.
+    Returns a list of simple filenames of the processed M4A files,
+    which reside in TEMP_DIR/book_title/.
+    """
+
+    
+
+    import concurrent.futures
+
+    max_workers = min(4, os.cpu_count() or 1, len(chapter_full_paths))
+    if max_workers == 0 and len(chapter_full_paths) > 0:
+        max_workers = 1
+
+    # Initialize list to store results (simple filenames) in the correct order
+    processed_m4a_simple_filenames_ordered = [None] * len(chapter_full_paths)
+
+    post_processing_bar = tqdm(
+        total=len(chapter_full_paths), unit="chapter", desc="Post Processing (Parallel)"
+    )
+
+    if not chapter_full_paths:  # Handle empty list gracefully
+        post_processing_bar.close()
+        return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Map futures to their original index to ensure order is preserved
+        future_to_index = {
+            executor.submit(add_silence_to_audio_file_by_appending_silence_file, chapter_full_paths[i]): i
+            for i in range(len(chapter_full_paths))
+        }
+
+        for future in concurrent.futures.as_completed(future_to_index):
+            original_index = future_to_index[future]
+            try:
+                processed_full_path = future.result()
+                # Extract just the filename from the full path
+                processed_simple_filename = os.path.basename(processed_full_path)
+                processed_m4a_simple_filenames_ordered[original_index] = (
+                    processed_simple_filename
+                )
+                post_processing_bar.update(1)
+            except Exception as e:
+                failed_chapter_name = "unknown"
+                if original_index < len(chapter_full_paths):
+                    failed_chapter_name = os.path.basename(
+                        chapter_full_paths[original_index]
+                    )
                 print(
                     f"Error in post-processing for chapter {failed_chapter_name}: {e}"
                 )
@@ -287,10 +291,7 @@ async def parallel_post_processing(chapter_files, book_title, output_format):
 
     post_processing_bar.close()
 
-    # The m4a_chapter_files list is now populated in the correct order,
-    # so sorting is no longer needed.
-    # m4a_chapter_files.sort() # This line is removed
-    return m4a_chapter_files
+    return processed_m4a_simple_filenames_ordered
 
 
 def find_voice_for_gender_score(character: str, character_gender_map, voice_map):
@@ -376,45 +377,6 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
         return "af_heart"  # Default fallback voice
 
 
-def validate_and_clean_text_for_tts(text):
-    """
-    Validate and clean text before sending to TTS API.
-    Returns cleaned text or None if text should be skipped.
-    """
-    if not text:
-        return None
-
-    text = text.strip()
-    if not text:
-        return None
-
-    # Check for minimum meaningful content
-    if len(text) < 1:
-        return None
-
-    # Check if text has any speakable content (letters or numbers)
-    import re
-
-    if not re.search(r"[a-zA-Z0-9]", text):
-        # Only punctuation/symbols, might cause TTS issues
-        print(f"WARNING: Text contains no alphanumeric characters: '{text}'")
-        # Return None to skip this part, or add minimal content
-        if len(text) <= 5:  # Very short punctuation-only text
-            return None
-        else:
-            # Add minimal speakable content for longer punctuation
-            return f"Pause. {text}"
-
-    # Remove excessive whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-
-    # Ensure minimum length for TTS
-    if len(text) < 2:
-        text = f"{text}."
-
-    return text
-
-
 def preprocess_text_for_orpheus(text):
     """
     Preprocess text for Orpheus TTS to prevent repetition issues.
@@ -459,7 +421,6 @@ def preprocess_text_for_orpheus(text):
 async def generate_audio_files(
     output_format,
     narrator_gender,
-    generate_m4b_audiobook_file=False,
     book_path="",
     book_title="audiobook",
     type="single_voice",
@@ -477,7 +438,6 @@ async def generate_audio_files(
     Args:
         output_format (str): The desired output format for the final audiobook (e.g., "mp3", "wav").
         narrator_gender (str): The gender of the narrator ("male" or "female") to select appropriate voices.
-        generate_m4b_audiobook_file (bool, optional): Flag to determine whether to generate an M4B file. Defaults to False.
         book_path (str, optional): The file path for the book to be used in M4B creation. Defaults to an empty string.
 
     Yields:
@@ -497,112 +457,77 @@ async def generate_audio_files(
 
         # Process the book and extract text
         for text in process_book_and_extract_text(book_path, "textract", book_title):
-            pass  # The function saves the file automatically
+            pass 
         yield "Book conversion completed"
 
-    with open(converted_book_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    single_voice_lines = text.split("\n")
-    # Filter out empty lines
-    single_voice_lines = [line.strip() for line in single_voice_lines if line.strip()]
+    lines_to_process = []
 
-    # Initialize json_data_array here before it's potentially used
-    json_data_array = []
-    lines_to_process = []  # This will hold the actual lines/data for processing
+    # Import the improved voice selection utilities
+    from utils.select_voice import select_voice
 
     # Setup for multi-voice lines
+    character_gender_map = None
+    voice_map = None
+    narrator_voice = ""
+    dialogue_voice = ""
+    
     if type.lower() == "multi_voice":
         print(f"Processing multi-voice lines")
-        # Construct file paths within the book's temp directory
-        speaker_file_path = os.path.join(
-            TEMP_DIR, book_title, "speaker_attributed_book.jsonl"
-        )
-        character_map_file_path = os.path.join(
-            TEMP_DIR, book_title, "character_gender_map.json"
-        )
 
-        # Check if the JSONL file exists
-        if not os.path.exists(speaker_file_path):
-            yield f"Error: {speaker_file_path} not found. Please run identify_characters_and_output_book_to_jsonl.py first to generate speaker-attributed lines."
-            return
-
-        # Check if the character map JSON file exists
-        if not os.path.exists(character_map_file_path):
-            yield f"Error: {character_map_file_path} not found. Please run identify_characters_and_output_book_to_jsonl.py first."
-            return
-
-        with open(speaker_file_path, "r", encoding="utf-8") as file:
-            for line in file:
-                # Parse each line as a JSON object
-                json_object = json.loads(line.strip())
-                # Append the parsed JSON object to the array
-                json_data_array.append(json_object)
+        try:
+            voice_config = select_voice(narrator_gender, MODEL, "multi_voice", book_title)
+            speaker_file_path = voice_config["speaker_file_path"]
+            narrator_voice = voice_config["narrator_voice"]
+            
+            # Load character gender map and voice map once for multi-voice mode
+            with open(voice_config["character_map_path"], "r", encoding="utf-8") as f:
+                character_gender_map = json.load(f)
+            with open(voice_config["voice_map_path"], "r", encoding="utf-8") as f:
+                voice_map = json.load(f)
+            
+            with open(speaker_file_path, "r", encoding="utf-8") as file:
+                for line in file:
+                    # Parse each line as a JSON object
+                    json_object = json.loads(line.strip())
+                    # Append the parsed JSON object to the array
+                    lines_to_process.append(json_object)
 
             yield "Loaded speaker-attributed lines from JSONL file"
 
-        # Load mappings for character gender and voice selection
-        character_gender_map = read_json(character_map_file_path)
-        print(f"Character gender map: {character_gender_map}")
-        voice_map = None
+        except (FileNotFoundError, ValueError) as e:
+            yield f"Error: {str(e)}"
+            return
+
         total_lines = len(
-            json_data_array
-        )  # total_lines is based on json_data_array for multi-voice
-        lines_to_process = json_data_array
-        print(f"Lines to process: {lines_to_process}")
-        print(f"JSON data array: {json_data_array}")
+            lines_to_process
+        )  
 
-        if narrator_gender == "male":
-            if MODEL == "kokoro":
-                voice_map = read_json(
-                    "static_files/kokoro_voice_map_male_narrator.json"
-                )
-            else:
-                voice_map = read_json(
-                    "static_files/orpheus_voice_map_male_narrator.json"
-                )
-        else:
-            if MODEL == "kokoro":
-                voice_map = read_json(
-                    "static_files/kokoro_voice_map_female_narrator.json"
-                )
-            else:
-                voice_map = read_json(
-                    "static_files/orpheus_voice_map_female_narrator.json"
-                )
-
-        narrator_voice = find_voice_for_gender_score(
-            "narrator", character_gender_map, voice_map
-        )
         yield "Loaded voice mappings and selected narrator voice"
 
     else:
-        # Set the voices to be used
-        narrator_voice = ""  # voice to be used for narration
-        dialogue_voice = ""  # voice to be used for dialogue
-        total_lines = len(
-            single_voice_lines
-        )  # total_lines is based on single_voice_lines for single-voice
-        lines_to_process = single_voice_lines
+        # handle single voice
+        try:
+            voice_config = select_voice(narrator_gender, MODEL, "single_voice", book_title)
+            narrator_voice = voice_config["narrator_voice"]
+            dialogue_voice = voice_config["dialogue_voice"]
+            
+            with open(converted_book_path, "r", encoding="utf-8") as f:
+                text = f.read()
+                lines_to_process = text.split("\n")
+                lines_to_process = [line.strip() for line in lines_to_process if line.strip()]
 
-        if narrator_gender == "male":
-            if MODEL == "kokoro":
-                narrator_voice = "am_puck"
-                dialogue_voice = "af_alloy"
-            else:
-                narrator_voice = "leo"
-                dialogue_voice = "dan"
-        else:
-            if MODEL == "kokoro":
-                narrator_voice = "af_heart"
-                dialogue_voice = "af_sky"
-            else:
-                narrator_voice = "tara"
-                dialogue_voice = "leah"
+        except (FileNotFoundError, ValueError) as e:
+            yield f"Error: {str(e)}"
+            return
+
+        total_lines = len(
+            lines_to_process
+        )  
 
     # Setup directories
     temp_line_audio_dir = os.path.join(TEMP_DIR, book_title, "line_segments")
 
-    # if the directory exists we may resume from the last line or use the files to create a different format of the audiobook (e.g. mp3) saving time from re-generating the audio files
+    # restart from the last line if the directory exists or create a new directory
     if os.path.exists(temp_line_audio_dir):
         resume_index, _ = get_task_progress_index(task_id)
         print(f"Resuming from line {resume_index}")
@@ -618,21 +543,16 @@ async def generate_audio_files(
     # Initial setup for chapters
     chapter_index = 1
 
-    if MODEL == "orpheus":
-        current_chapter_audio = "Introduction.m4a"
-    else:
-        current_chapter_audio = f"Introduction.{output_format}"
+    current_chapter_audio = "Introduction.m4a"
     chapter_files = []
-
     resume_index = 0
     if task_id:
         resume_index, _ = get_task_progress_index(task_id)
         print(f"Resuming from line {resume_index}")
 
     progress_counter = 0
-    progress_lock = asyncio.Lock()  # Add lock for progress counter synchronization
+    progress_lock = asyncio.Lock()  
 
-    # For tracking progress with tqdm in an async context
     progress_bar = tqdm(
         total=total_lines, unit="line", desc="Audio Generation Progress"
     )
@@ -663,63 +583,20 @@ async def generate_audio_files(
 
     async def process_single_line(
         line_index,
-        line,  # 'line' is a dict for multi-voice, str for single-voice
+        line, 
         type="single_voice",
     ):
         async with semaphore:
             nonlocal progress_counter
 
             actual_text_content = ""
-            voice_for_this_line_multi_voice = (
-                None  # Store the determined voice for multi-voice lines
-            )
+            speaker_name = ""
 
             if type.lower() == "multi_voice":
-                # 'line' is expected to be a dictionary: {"line": "text", "speaker": "X"}
-                if isinstance(line, dict):
-                    actual_text_content = line.get("line", "").strip()
-                    speaker_name = line.get("speaker", "").strip()
-
-                    if not speaker_name:  # Speaker name is crucial for multi-voice
-                        print(
-                            f"Warning: Missing speaker name in multi-voice data at index {line_index}: {line}"
-                        )
-                        # Decide how to handle, e.g., skip or use a default narrator voice. For now, it might fail in find_voice_for_gender_score or use narrator.
-                        # If actual_text_content is also empty, it will be caught by the check below.
-
-                    # Only find voice if speaker_name is present
-                    if speaker_name:
-                        voice_for_this_line_multi_voice = find_voice_for_gender_score(
-                            speaker_name, character_gender_map, voice_map
-                        )
-                        print(
-                            f"Speaker: {speaker_name}, Voice: {voice_for_this_line_multi_voice}"
-                        )
-                    else:  # Fallback if speaker_name is missing, could use narrator or a default
-                        print(
-                            f"Warning: Using narrator voice for line index {line_index} due to missing speaker."
-                        )
-                        voice_for_this_line_multi_voice = (
-                            narrator_voice  # Or handle as an error
-                        )
-
-                    print(f"Line: {actual_text_content}")
-                else:
-                    print(
-                        f"ERROR: Expected a dictionary for multi-voice line at index {line_index}, but got {type(line)}. Content: {line}"
-                    )
-                    # Fallback to treating 'line' as string, or skip
-                    actual_text_content = str(line).strip()
-                    # No specific speaker voice can be determined here, will use general dialogue/narrator voice if it proceeds
-            else:  # single_voice
-                # 'line' is a string
-                actual_text_content = str(line).strip()  # Ensure it's a string
-
-            if not actual_text_content:
-                # It's important to update progress even for skipped lines if they are part of total_lines
-                # However, the original code didn't explicitly update progress here.
-                # Assuming empty lines don't contribute to audio parts.
-                return None
+                actual_text_content = line.get("line", "").strip()
+                speaker_name = line.get("speaker", "").strip()
+            else:  
+                actual_text_content = str(line).strip()
 
             annotated_parts = split_and_annotate_text(actual_text_content)
             audio_parts = []
@@ -745,46 +622,33 @@ async def generate_audio_files(
                         )
                         raise asyncio.CancelledError("Task was cancelled by user")
 
-                    text_to_speak = validate_and_clean_text_for_tts(text_to_speak)
-                    if text_to_speak is None:
-                        print(
-                            f"Skipping invalid text part {i} in line {line_index} ('{actual_text_content[:50]}...')"
-                        )
-                        continue
-
                     if MODEL == "orpheus":
+                        # add full stops where necessary
                         text_to_speak = preprocess_text_for_orpheus(text_to_speak)
 
-                    if not text_to_speak:
-                        print(
-                            f"Skipping empty text part {i} in line {line_index} ('{actual_text_content[:50]}...') after processing"
-                        )
-                        continue
-
-                    voice_to_use_for_this_part = ""
+                    voice = ""
                     if type.lower() == "multi_voice":
-                        # For multi-voice, the entire line (all its parts) uses the determined speaker's voice.
-                        voice_to_use_for_this_part = voice_for_this_line_multi_voice
-                        if (
-                            not voice_to_use_for_this_part
-                        ):  # Fallback if voice couldn't be determined
-                            print(
-                                f"Warning: No specific voice for multi-voice part, falling back to narrator for line {line_index}"
-                            )
-                            voice_to_use_for_this_part = narrator_voice
-                    else:  # single_voice
-                        # For single-voice, distinguish between narration and dialogue voices.
-                        voice_to_use_for_this_part = (
-                            narrator_voice
-                            if part["type"] == "narration"
-                            else dialogue_voice
-                        )
+                        # For multi-voice mode, use speaker-based voice selection
+                        if speaker_name and speaker_name.lower() == "narrator":
+                            voice = narrator_voice
+                        elif speaker_name and character_gender_map and voice_map:
+                            voice = find_voice_for_gender_score(speaker_name, character_gender_map, voice_map)
+                        else:
+                            # Fallback to narrator voice if speaker not found
+                            voice = narrator_voice
+                            print(f"[DEBUG] Using narrator voice fallback for speaker: {speaker_name}")
+                    else:
+                        # For single-voice mode, use narration/dialogue logic
+                        if part["type"] == "narration":
+                            voice = narrator_voice
+                        else:
+                            voice = dialogue_voice
 
                     try:
 
                         current_part_audio_buffer = await generate_tts_with_retry(
                             MODEL,
-                            voice_to_use_for_this_part,  # Use the correctly determined voice
+                            voice,  
                             text_to_speak,
                             API_OUTPUT_FORMAT,
                             speed=0.85,
@@ -812,9 +676,7 @@ async def generate_audio_files(
                             os.remove(line_audio_path)
                         raise
                     except Exception as e:
-                        print(
-                            f"CRITICAL ERROR: TTS failed after all retries for part type '{part['type']}', voice '{voice_to_use_for_this_part}', text: '{text_to_speak[:50]}...': {e}"
-                        )
+
                         # Clean up any created files and remove final line file before re-raising
                         for part_file in audio_parts:
                             if os.path.exists(part_file):
@@ -834,7 +696,7 @@ async def generate_audio_files(
                 raise e
 
             if audio_parts:
-                concatenate_audio_files(audio_parts, line_audio_path, API_OUTPUT_FORMAT)
+                concatenate_wav_files(audio_parts, line_audio_path)
                 # Clean up individual part files after successful concatenation
                 for part_file in audio_parts:
                     if os.path.exists(part_file):
@@ -865,7 +727,7 @@ async def generate_audio_files(
         task_to_index[task] = i
 
     # Initialize results_all list
-    results_all = [None] * total_lines  # Use total_lines for sizing results_all
+    results_all = [None] * total_lines  
 
     # Create a cancellation monitor task
     async def cancellation_monitor():
@@ -977,12 +839,8 @@ async def generate_audio_files(
         if result["is_chapter_heading"]:
             chapter_index += 1
 
-            if MODEL == "orpheus":
-                current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
-            else:
-                current_chapter_audio = (
-                    f"{sanitize_filename(result['line'])}.{output_format}"
-                )
+            # Always assemble chapters as M4A files first, regardless of final output format
+            current_chapter_audio = f"{sanitize_filename(result['line'])}.m4a"
 
         if current_chapter_audio not in chapter_files:
             chapter_files.append(current_chapter_audio)
@@ -994,43 +852,35 @@ async def generate_audio_files(
 
     chapter_organization_bar.close()
     yield "Organizing audio by chapters complete"
-
-    concatenate_chapters(
+    # concatenate chapters into m4a files
+    chapter_files = concatenate_chapters(
         chapter_files, book_title, chapter_line_map, temp_line_audio_dir
     )
-  
+    yield f"Completed concatenating {len(chapter_files)} chapters"
 
     # Optimized parallel post-processing
     yield "Starting parallel post-processing..."
-    m4a_chapter_files = await parallel_post_processing(
+    chapter_files = await parallel_post_processing(
         chapter_files, book_title, output_format
     )
-    yield f"Completed parallel post-processing of {len(m4a_chapter_files)} chapters"
+    yield f"Completed parallel post-processing of {len(chapter_files)} chapters"
 
-    # Clean up temp line audio files
-    # shutil.rmtree(temp_line_audio_dir)
-    # yield "Cleaned up temporary files"
+    
 
     # create audiobook directory if it does not exist
     os.makedirs(f"generated_audiobooks", exist_ok=True)
 
-    if generate_m4b_audiobook_file:
-        # Merge all chapter files into a final m4b audiobook
-        yield "Creating M4B audiobook file..."
-        merge_chapters_to_m4b(book_path, m4a_chapter_files, book_title)
-        # clean the temp directory
-        shutil.rmtree(f"{TEMP_DIR}/{book_title}")
-        yield "M4B audiobook created successfully"
+    yield "Creating final audiobook..."
+    if output_format == "m4b":
+        merge_chapters_to_m4b(book_path, chapter_files, book_title)
     else:
-        # Merge all chapter files into a standard M4A audiobook
-        yield "Creating final audiobook..."
-        merge_chapters_to_standard_audio_file(m4a_chapter_files, book_title)
-        safe_book_title = sanitize_book_title_for_filename(book_title)
-        # always convert to m4a first
+        merge_chapters_to_standard_audio_file(chapter_files, book_title)
+    # convert to final output format
         convert_audio_file_formats(
-            "m4a", output_format, "generated_audiobooks", safe_book_title
+        "m4a", output_format, "generated_audiobooks", book_title
         )
-        yield f"Audiobook in {output_format} format created successfully"
+
+    yield f"Audiobook in {output_format} format created successfully"
 
 
 async def process_audiobook_generation(
@@ -1051,21 +901,15 @@ async def process_audiobook_generation(
     if not is_tts_api_up:
         raise Exception(message)
 
-    generate_m4b_audiobook_file = False
-    # Determine the actual format to use for intermediate files
-    actual_output_format = output_format
 
-    if output_format == "M4B (Chapters & Cover)":
-        generate_m4b_audiobook_file = True
-        actual_output_format = "m4a"  # Use m4a for intermediate files when creating M4B
+    
 
     if voice_option == "Single Voice":
         yield "\n🎧 Generating audiobook with a **single voice**..."
         await asyncio.sleep(1)
         async for line in generate_audio_files(
-            actual_output_format.lower(),
+            output_format.lower(),
             narrator_gender,
-            generate_m4b_audiobook_file,
             book_path,
             book_title,
             "single_voice",
@@ -1076,9 +920,8 @@ async def process_audiobook_generation(
         yield "\n🎭 Generating audiobook with **multiple voices**..."
         await asyncio.sleep(1)
         async for line in generate_audio_files(
-            actual_output_format.lower(),
+            output_format.lower(),
             narrator_gender,
-            generate_m4b_audiobook_file,
             book_path,
             book_title,
             "multi_voice",
@@ -1092,8 +935,7 @@ async def process_audiobook_generation(
 async def main(
     book_title="audiobook",
     book_path="./sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub",
-    output_format="aac",
-    generate_m4b_audiobook_file=False,
+    output_format="wav",
     voice_option="single",
     narrator_gender="male",
 ):
@@ -1101,7 +943,7 @@ async def main(
 
     # Check if we're running with command line arguments (non-interactive mode)
     running_with_args = (
-        len(sys.argv) > 1 or voice_option != "single" or generate_m4b_audiobook_file
+        len(sys.argv) > 1 
     )
 
     if not running_with_args:
@@ -1128,7 +970,7 @@ async def main(
             voice_option = "1"
         else:
             voice_option = "2"
-        audiobook_type_option = "1" if generate_m4b_audiobook_file else "2"
+        audiobook_type_option = "1" if output_format == "m4b" else "2"
 
     if audiobook_type_option == "1":
         is_calibre_installed = check_if_calibre_is_installed()
@@ -1167,15 +1009,14 @@ async def main(
 
         print("✅ Book path set. Proceeding...\n")
 
-        generate_m4b_audiobook_file = True
     else:
         # Prompt user for audio format selection
         print("\n🎙️ **Audiobook Output Format Selection**")
         output_format = input(
-            "🔹 Choose between ['aac', 'm4a', 'mp3', 'wav', 'opus', 'flac', 'pcm']. "
+            "🔹 Choose between ['m4b', 'aac', 'm4a', 'mp3', 'wav', 'opus', 'flac', 'pcm']. "
         ).strip()
 
-        if output_format not in ["aac", "m4a", "mp3", "wav", "opus", "flac", "pcm"]:
+        if output_format not in ["m4b", "aac", "m4a", "mp3", "wav", "opus", "flac", "pcm"]:
             print("\n⚠️ Invalid output format! Please choose from the give options")
             return
 
@@ -1197,7 +1038,6 @@ async def main(
         async for line in generate_audio_files(
             output_format,
             narrator_gender,
-            generate_m4b_audiobook_file,
             book_path,
             book_title,
             "single_voice",
@@ -1209,7 +1049,6 @@ async def main(
         async for line in generate_audio_files(
             output_format,
             narrator_gender,
-            generate_m4b_audiobook_file,
             book_path,
             book_title,
             "multi_voice",
@@ -1221,7 +1060,7 @@ async def main(
         return
 
     print(
-        f"\n🎧 Audiobook is generated ! The audiobook is saved as **audiobook.{"m4b" if generate_m4b_audiobook_file else output_format}** in the **generated_audiobooks** directory in the current folder."
+        f"\n🎧 Audiobook is generated ! The audiobook is saved as **audiobook.{output_format}** in the **generated_audiobooks** directory in the current folder."
     )
 
     end_time = time.time()

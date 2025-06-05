@@ -21,44 +21,37 @@ import json
 import shutil
 import traceback
 import wave
-
-
-def concatenate_audio_files(audio_files, output_file, input_format):
-    """
-    Concatenates multiple audio files into a single audio file.
-    """
-    if not audio_files:
-        raise ValueError("No audio files provided")
-
-    if not output_file:
-        raise ValueError("No output file provided")
-
-    if input_format == "wav":
-        concatenate_wav_files(audio_files, output_file)
-    else:
-        try:
-            audio_buffer = bytearray()
-            for audio_file in audio_files:
-                with open(audio_file, "rb") as f:
-                    audio_buffer.extend(f.read())
-            with open(output_file, "wb") as f:
-                f.write(audio_buffer)
-        except Exception as e:
-            print(f"Error concatenating audio files: {e}")
-            raise e
+from pydub import AudioSegment
 
 
 def concatenate_wav_files(part_files, output_path):
-    with wave.open(output_path, "wb") as output:
-        for i, part_file in enumerate(part_files):
-            with wave.open(part_file, "rb") as input_wave:
-                if i == 0:
-                    # Set parameters from first file
-                    output.setparams(input_wave.getparams())
-
-                # Read and write frames
-                frames = input_wave.readframes(input_wave.getnframes())
-                output.writeframes(frames)
+    """
+    Concatenate WAV files using PyDub with better quality and metadata preservation.
+    """
+    if not part_files:
+        raise ValueError("No input files provided")
+    
+    # Start with the first file
+    combined = AudioSegment.from_wav(part_files[0])
+    
+    # Add each subsequent file
+    for part_file in part_files[1:]:
+        audio_segment = AudioSegment.from_wav(part_file)
+        
+        # Ensure compatible format (sample rate, channels, etc.)
+        if audio_segment.frame_rate != combined.frame_rate:
+            audio_segment = audio_segment.set_frame_rate(combined.frame_rate)
+        if audio_segment.channels != combined.channels:
+            audio_segment = audio_segment.set_channels(combined.channels)
+            
+        combined += audio_segment
+    
+    # Export with high quality settings
+    combined.export(
+        output_path,
+        format="wav",
+        parameters=["-acodec", "pcm_s16le"]  # Ensures lossless quality
+    )
 
 
 def empty_file(file_name):

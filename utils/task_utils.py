@@ -38,11 +38,14 @@ def get_past_generated_files():
         pattern = os.path.join(audiobooks_dir, "*")
         files = glob.glob(pattern)
 
-        # Filter out directories and get file info
+        # Filter out directories, hidden files (starting with .), and get file info
         audiobook_files = []
         for file_path in files:
             if os.path.isfile(file_path):
                 filename = os.path.basename(file_path)
+                # Skip hidden files (starting with a period)
+                if filename.startswith('.'):
+                    continue
                 # Get file size and modification time
                 stat_info = os.stat(file_path)
                 size_mb = round(stat_info.st_size / (1024 * 1024), 2)
@@ -189,46 +192,6 @@ def remove_task(task_id):
     if task_id in tasks:
         del tasks[task_id]
         save_tasks(tasks)
-
-
-def get_past_generated_files():
-    """Get list of past generated audiobook files"""
-    try:
-        audiobooks_dir = "generated_audiobooks"
-        if not os.path.exists(audiobooks_dir):
-            return []
-
-        # Get all files in the generated_audiobooks directory
-        pattern = os.path.join(audiobooks_dir, "*")
-        files = glob.glob(pattern)
-
-        # Filter out directories and get file info
-        audiobook_files = []
-        for file_path in files:
-            if os.path.isfile(file_path):
-                filename = os.path.basename(file_path)
-                # Get file size and modification time
-                stat_info = os.stat(file_path)
-                size_mb = round(stat_info.st_size / (1024 * 1024), 2)
-                mod_time = datetime.fromtimestamp(stat_info.st_mtime).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-
-                audiobook_files.append(
-                    {
-                        "path": file_path,
-                        "filename": filename,
-                        "size_mb": size_mb,
-                        "modified": mod_time,
-                    }
-                )
-
-        # Sort by modification time (newest first)
-        audiobook_files.sort(key=lambda x: os.path.getmtime(x["path"]), reverse=True)
-        return audiobook_files
-    except Exception as e:
-        print(f"Error getting past files: {e}")
-        return []
 
 
 def get_task_progress_index(task_id):

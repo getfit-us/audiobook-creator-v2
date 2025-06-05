@@ -62,9 +62,24 @@ def download_with_progress(model_name):
 
 load_dotenv()
 
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "lm-studio")
-OPENAI_MODEL_NAME = os.environ.get("OPENAI_MODEL_NAME", "qwen3-14b")
+from utils.config_manager import config_manager
+
+# Get LLM configuration from config manager
+def get_llm_config():
+    """Get current LLM configuration"""
+    llm_config = config_manager.get_llm_config()
+    return {
+        'base_url': llm_config.get("base_url", "http://localhost:1234/v1"),
+        'api_key': llm_config.get("api_key", "lm-studio"),
+        'model_name': llm_config.get("model_name", "qwen3-14b"),
+        'no_think_mode': llm_config.get("no_think_mode", True)
+    }
+
+# Initialize configuration
+_llm_config = get_llm_config()
+OPENAI_BASE_URL = _llm_config['base_url']
+OPENAI_API_KEY = _llm_config['api_key']
+OPENAI_MODEL_NAME = _llm_config['model_name']
 
 # warnings.simplefilter("ignore")
 
@@ -486,7 +501,7 @@ async def identify_characters_and_output_book_to_jsonl(
 
 
 async def process_book_and_identify_characters(book_title):
-    converted_book_path = f"'{TEMP_DIR}/{book_title}/converted_book.txt'"
+    converted_book_path = f"{TEMP_DIR}/{book_title}/converted_book.txt"
     is_llm_up, message = await check_if_llm_is_up(async_openai_client, model_name)
 
     if not is_llm_up:

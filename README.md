@@ -41,6 +41,7 @@ Watch the demo video:
 ## Key Features
 
 - **Gradio UI App**: Create audiobooks easily with an easy to use, intuitive UI made with Gradio.
+- **UI-based Configuration**: Configure TTS and LLM settings directly from the web interface - no need to edit .env files after initial setup. Settings are automatically saved and persistent across restarts.
 - **M4B Audiobook Creation**: Creates compatible audiobooks with covers, metadata, chapter timestamps etc. in M4B format.
 - **Multi-Format Input Support**: Converts books from various formats (EPUB, PDF, etc.) into plain text.
 - **Multi-Format Output Support**: Supports various output formats: AAC, M4A, MP3, WAV, OPUS, FLAC, PCM, M4B.
@@ -86,7 +87,13 @@ Watch the demo video:
    --restart always \
    --network host \
    --gpus all \
-   ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2 \
+   ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2     dropdown_update,  
+            group_update,  
+            gr.update(visible=continue_btn_visible),  dropdown_update,  
+            group_update,  
+            gr.update(visible=continue_btn_visible),  dropdown_update,  
+            group_update,  
+            gr.update(visible=continue_btn_visible), \
    uvicorn api.src.main:app --host 0.0.0.0 --port 8880 --log-level debug \
    --workers {MAX_PARALLEL_REQUESTS_BATCH_SIZE}
   ```

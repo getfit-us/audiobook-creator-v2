@@ -19,13 +19,16 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 import traceback
 import os
 from dotenv import load_dotenv
+from utils.config_manager import config_manager
 
 load_dotenv()
 
-NO_THINK_MODE = os.environ.get("NO_THINK_MODE", "true")
-
 def check_if_have_to_include_no_think_token():
-    if NO_THINK_MODE == True or NO_THINK_MODE == "true":
+    # Get no_think_mode from config manager
+    llm_config = config_manager.get_llm_config()
+    no_think_mode = llm_config.get("no_think_mode", True)
+    
+    if no_think_mode == True or no_think_mode == "true":
         return "/no_think"
     else:
         return ""

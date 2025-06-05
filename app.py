@@ -2,6 +2,17 @@
 Audiobook Creator
 Copyright (C) 2025 Prakhar Sharma
 
+Modified by:
+- Chris Scott
+- https://github.com/chris-scott
+- added support for orpheus tts api
+- Updated the UI to be more user friendly
+
+Original code by:
+- Prakhar Sharma
+- https://github.com/prakharsharma
+
+
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
@@ -39,6 +50,8 @@ from utils.task_utils import (
     unregister_running_task,
     clear_temp_files,
 )
+from utils.config_manager import config_manager
+from config.constants import reload_constants
 
 css = """
 .step-heading {font-size: 1.2rem; font-weight: bold; margin-bottom: 0.5rem}
@@ -108,6 +121,84 @@ def delete_audiobook_file(file_path):
         return gr.Warning(f"Error deleting file: {str(e)}")
 
 
+def delete_all_audiobooks():
+    """Delete all audiobook files and return status message"""
+    try:
+        audiobooks_dir = "generated_audiobooks"
+        if not os.path.exists(audiobooks_dir):
+            return gr.Warning("No audiobooks directory found.")
+        
+        # Get all files (excluding hidden files)
+        files = [f for f in os.listdir(audiobooks_dir) 
+                if os.path.isfile(os.path.join(audiobooks_dir, f)) and not f.startswith('.')]
+        
+        if not files:
+            return gr.Warning("No audiobooks found to delete.")
+        
+        # Calculate total size before deletion
+        total_size = 0
+        for file in files:
+            try:
+                total_size += os.path.getsize(os.path.join(audiobooks_dir, file))
+            except:
+                pass
+        
+        total_size_mb = round(total_size / (1024 * 1024), 2)
+        
+        # Delete all files
+        deleted_count = 0
+        failed_files = []
+        
+        for file in files:
+            file_path = os.path.join(audiobooks_dir, file)
+            try:
+                os.remove(file_path)
+                deleted_count += 1
+            except Exception as e:
+                failed_files.append(f"{file}: {str(e)}")
+        
+        if failed_files:
+            failed_msg = "\n".join(failed_files[:3])  # Show only first 3 failures
+            if len(failed_files) > 3:
+                failed_msg += f"\n... and {len(failed_files) - 3} more"
+            return gr.Warning(f"Deleted {deleted_count}/{len(files)} files ({total_size_mb} MB). Failures:\n{failed_msg}")
+        else:
+            return gr.Info(f"Successfully deleted all {deleted_count} audiobooks ({total_size_mb} MB).", duration=5)
+            
+    except Exception as e:
+        return gr.Warning(f"Error deleting audiobooks: {str(e)}")
+
+
+def get_all_audiobooks_info():
+    """Get information about all audiobooks for confirmation"""
+    try:
+        audiobooks_dir = "generated_audiobooks"
+        if not os.path.exists(audiobooks_dir):
+            return "No audiobooks directory found."
+        
+        files = [f for f in os.listdir(audiobooks_dir) 
+                if os.path.isfile(os.path.join(audiobooks_dir, f)) and not f.startswith('.')]
+        
+        if not files:
+            return "No audiobooks found to delete."
+        
+        total_size = 0
+        for file in files:
+            try:
+                total_size += os.path.getsize(os.path.join(audiobooks_dir, file))
+            except:
+                pass
+        
+        total_size_mb = round(total_size / (1024 * 1024), 2)
+        file_list = "\n".join([f"• {file}" for file in files[:10]])  # Show first 10 files
+        if len(files) > 10:
+            file_list += f"\n... and {len(files) - 10} more files"
+        
+        return f"**⚠️ Delete ALL audiobooks?**\n\n**Total: {len(files)} files ({total_size_mb} MB)**\n\nFiles to be deleted:\n{file_list}\n\n**This action cannot be undone!**"
+    except Exception as e:
+        return f"Error reading audiobooks: {str(e)}"
+
+
 def refresh_past_files_with_continue():
     files = get_past_generated_files()
     active_tasks = get_active_tasks()
@@ -115,8 +206,8 @@ def refresh_past_files_with_continue():
 
     # Build display text
     display_parts = []
-    continue_btn_visible = False
-    selected_task_id = None
+    task_choices = []
+    cancel_group_visible = False
 
     # Show active tasks first
     if active_tasks:
@@ -126,53 +217,48 @@ def refresh_past_files_with_continue():
                 f"⏳ **{task['id']}** - {task['progress']} ({task['timestamp'][:16]})"
             )
             display_parts.append(task_display)
+            # Add task to choices for cancellation
+            task_choices.append((f"{task['id']} - {task['progress']}", task['id']))
         display_parts.append("")  # Empty line
-        # If any active task is not completed or cancelled, show continue button
-        for task in active_tasks:
-            status = tasks.get(task["id"], {}).get("status", "")
-            if status not in ["completed", "cancelled"]:
-                continue_btn_visible = True
-                selected_task_id = task["id"]
-                break
+        
+        # Show cancel group if there are active tasks
+        if task_choices:
+            cancel_group_visible = True
 
     # Show past files
+    file_choices = []
     if not files:
         if not active_tasks:
-            display_parts.append("No past audiobooks found.")
+            display_parts.append("### 📂 Generated Audiobooks")
+            display_parts.append("✨ No audiobooks found. Generate your first audiobook above!")
+        # If there are active tasks but no completed files, don't show the empty message
     else:
         if active_tasks:
             display_parts.append("### 📁 Completed Audiobooks:")
+        else:
+            display_parts.append("### 📂 Generated Audiobooks")
 
-        file_choices = []
         for file_info in files:
             file_display = f"📁 **{file_info['filename']}** ({file_info['size_mb']} MB) - {file_info['modified']}"
             display_parts.append(file_display)
             file_choices.append((file_info["filename"], file_info["path"]))
 
-        file_text = "\n\n".join(display_parts)
-        dropdown_update, group_update = get_active_tasks_for_dropdown()
-        return (
-            gr.update(value=file_text, visible=True),
-            gr.update(
-                choices=file_choices,
-                value=file_choices[0][1] if file_choices else None,
-                visible=bool(file_choices),
-            ),
-            gr.update(visible=bool(file_choices)),
-            dropdown_update,  # Return active tasks dropdown update
-            group_update,  # Return cancel task group visibility update
-            gr.update(visible=continue_btn_visible),  # Continue button visibility
-        )
-
     file_text = "\n\n".join(display_parts)
-    dropdown_update, group_update = get_active_tasks_for_dropdown()
+    
     return (
-        gr.update(value=file_text, visible=True),
-        gr.update(choices=[], value=None, visible=False),
-        gr.update(visible=False),
-        dropdown_update,  # Return active tasks dropdown update
-        group_update,  # Return cancel task group visibility update
-        gr.update(visible=continue_btn_visible),  # Continue button visibility
+        gr.update(value=file_text, visible=True),  # past_files_display
+        gr.update(
+            choices=file_choices,
+            value=file_choices[0][1] if file_choices else None,
+            visible=bool(file_choices),
+        ),  # past_files_dropdown
+        gr.update(visible=bool(file_choices)),  # delete_btn
+        gr.update(
+            choices=task_choices,
+            value=task_choices[0][1] if task_choices else None,
+            visible=bool(task_choices),
+        ),  # active_tasks_dropdown
+        gr.update(visible=cancel_group_visible),  # cancel_task_group
     )
 
 
@@ -358,29 +444,19 @@ async def generate_audiobook_wrapper(
             update_task_status(task_id, "running", output)
             yield output, None  # Yield each progress update without file path
 
-        # Get the correct file extension based on the output format
-        generate_m4b_audiobook_file = (
-            True if output_format == "M4B (Chapters & Cover)" else False
-        )
-        file_extension = "m4b" if generate_m4b_audiobook_file else output_format.lower()
-
-        # Set the audiobook file path according to the provided information
-        # Sanitize book title for filename
-        safe_book_title = "".join(
-            c for c in book_title if c.isalnum() or c in (" ", "-", "_")
-        ).rstrip()
-        safe_book_title = (
-            safe_book_title or "audiobook"
-        )  # fallback if title becomes empty
-        audiobook_path = os.path.join(
-            "generated_audiobooks", f"{safe_book_title}.{file_extension}"
-        )
+        # Construct the expected audiobook file path
+        audiobook_filename = f"{book_title}.{output_format.lower()}"
+        audiobook_path = os.path.join("generated_audiobooks", audiobook_filename)
+        
+        # Verify the file exists before returning it
+        if not os.path.exists(audiobook_path):
+            audiobook_path = None
 
         # Mark task as completed
         update_task_status(
             task_id,
             "completed",
-            f"Audiobook generated successfully: {safe_book_title}.{file_extension}",
+            f"Audiobook generated successfully: {book_title}.{output_format.lower()}",
         )
 
         # Unregister the task
@@ -388,9 +464,9 @@ async def generate_audiobook_wrapper(
 
         # Final yield with success notification and file path
         yield gr.Info(
-            f"Audiobook generated successfully in {output_format} format! You can now download it in the Download section. Click on the blue download link next to the file name. If you lost connection during generation, check the 'Past Generated Audiobooks' section.",
+            f"Audiobook generated successfully in {output_format} format! You can now download it below.",
             duration=15,
-        ), None
+        ), audiobook_path
         yield last_output, audiobook_path
         return
     except asyncio.CancelledError:
@@ -411,46 +487,83 @@ async def generate_audiobook_wrapper(
         return
 
 
-def clear_old_tasks(keep_recent_hours=24):
-    """Clear old completed/failed tasks and very old tasks"""
-    tasks = load_tasks()
-    current_time = datetime.now()
-    tasks_removed = 0
 
-    tasks_to_remove = []
-    for task_id, task_info in tasks.items():
+
+
+def get_temp_directory_info():
+    """Get information about temp directories and files that would be cleared"""
+    info_parts = []
+    total_size_mb = 0
+    total_files = 0
+    
+    # Check temp directory
+    temp_dir = "temp"
+    if os.path.exists(temp_dir):
         try:
-            task_time = datetime.fromisoformat(task_info["timestamp"])
-            hours_old = (current_time - task_time).total_seconds() / 3600
-
-            # Remove completed or failed tasks
-            if task_info.get("status") in ["completed", "failed"]:
-                tasks_to_remove.append(task_id)
-                tasks_removed += 1
-            # Remove very old tasks regardless of status
-            elif hours_old > keep_recent_hours:
-                tasks_to_remove.append(task_id)
-                tasks_removed += 1
+            for item in os.listdir(temp_dir):
+                # Skip hidden files and directories (starting with a period)
+                if item.startswith('.'):
+                    continue
+                    
+                item_path = os.path.join(temp_dir, item)
+                if os.path.isdir(item_path):
+                    # Count files and calculate size for this subdirectory
+                    dir_files = 0
+                    dir_size = 0
+                    for root, dirs, files in os.walk(item_path):
+                        # Filter out hidden files from the count
+                        visible_files = [f for f in files if not f.startswith('.')]
+                        dir_files += len(visible_files)
+                        for file in visible_files:
+                            file_path = os.path.join(root, file)
+                            try:
+                                dir_size += os.path.getsize(file_path)
+                            except:
+                                pass
+                    
+                    if dir_files > 0:
+                        dir_size_mb = dir_size / (1024 * 1024)
+                        info_parts.append(f"📁 **{item}** - {dir_files} files ({dir_size_mb:.1f} MB)")
+                        total_size_mb += dir_size_mb
+                        total_files += dir_files
+                elif os.path.isfile(item_path):
+                    # Single file in temp directory
+                    try:
+                        file_size = os.path.getsize(item_path) / (1024 * 1024)
+                        info_parts.append(f"📄 **{item}** ({file_size:.1f} MB)")
+                        total_size_mb += file_size
+                        total_files += 1
+                    except:
+                        pass
+        except Exception as e:
+            info_parts.append(f"❌ Error reading temp directory: {str(e)}")
+    
+    # Check generated_audiobooks directory for old files
+    generated_dir = "generated_audiobooks"
+    if os.path.exists(generated_dir):
+        try:
+            audiobook_files = [f for f in os.listdir(generated_dir) 
+                             if os.path.isfile(os.path.join(generated_dir, f)) and not f.startswith('.')]
+            if audiobook_files:
+                generated_size = 0
+                for file in audiobook_files:
+                    try:
+                        generated_size += os.path.getsize(os.path.join(generated_dir, file))
+                    except:
+                        pass
+                generated_size_mb = generated_size / (1024 * 1024)
+                info_parts.append(f"🎵 **generated_audiobooks** - {len(audiobook_files)} files ({generated_size_mb:.1f} MB)")
         except:
-            # Remove tasks with invalid timestamp
-            tasks_to_remove.append(task_id)
-            tasks_removed += 1
-
-    # Remove the identified tasks
-    for task_id in tasks_to_remove:
-        del tasks[task_id]
-
-    save_tasks(tasks)
-    return tasks_removed
+            pass
+    
+    if not info_parts:
+        return "✨ No temp files found - nothing to clear!"
+    
+    header = f"### 🧹 Files that will be cleared:\n**Total: {total_files} files ({total_size_mb:.1f} MB)**\n\n"
+    return header + "\n".join(info_parts)
 
 
-def clear_old_tasks_wrapper():
-    """Wrapper for clearing temp files including tasks"""
-    try:
-        clear_temp_files()
-    except Exception as e:
-        print(f"Error clearing old tasks: {e}")
-        return gr.Warning(f"Error clearing old tasks: {str(e)}")
+
 
 
 def cancel_task_wrapper(task_id):
@@ -469,82 +582,171 @@ def cancel_task_wrapper(task_id):
         return gr.Warning(f"Error cancelling task: {str(e)}")
 
 
-def get_active_tasks_for_dropdown():
-    """Get active tasks formatted for dropdown selection"""
-    active_tasks = get_active_tasks()
-    if not active_tasks:
-        return gr.update(choices=[], value=None, visible=False), gr.update(
-            visible=False
+def load_current_settings():
+    """Load current configuration settings for the UI"""
+    tts_config = config_manager.get_tts_config()
+    llm_config = config_manager.get_llm_config()
+    
+    return (
+        # TTS Settings
+        tts_config.get("base_url", "http://localhost:8880/v1"),
+        tts_config.get("api_key", "not-needed"),
+        tts_config.get("model", "kokoro"),
+        tts_config.get("max_parallel_requests", 2),
+        # LLM Settings
+        llm_config.get("base_url", "http://localhost:1234/v1"),
+        llm_config.get("api_key", "lm-studio"),
+        llm_config.get("model_name", "qwen3-14b"),
+        llm_config.get("no_think_mode", True)
+    )
+
+
+def save_tts_settings(base_url, api_key, model, max_parallel):
+    """Save TTS settings and reload constants"""
+    try:
+        config_manager.update_tts_config(
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+            max_parallel=int(max_parallel)
         )
-
-    choices = []
-    for task in active_tasks:
-        # Create a readable display name
-        display_name = f"{task['id']} - {task['status']} ({task['timestamp'][:16]})"
-        choices.append((display_name, task["id"]))
-
-    return gr.update(
-        choices=choices, value=choices[0][1] if choices else None, visible=True
-    ), gr.update(visible=True)
+        # Reload constants to pick up new values
+        reload_constants()
+        return gr.Info("TTS settings saved successfully!", duration=5)
+    except Exception as e:
+        return gr.Warning(f"Error saving TTS settings: {str(e)}")
 
 
-async def continue_audiobook_task(task_id):
-    tasks = load_tasks()
-    if not task_id or task_id not in tasks:
-        yield gr.Warning("Task not found."), None
-        yield None, None
-        return
-    params = tasks[task_id].get("params", {})
-    if not params:
-        yield gr.Warning("Task parameters not found. Cannot resume."), None
-        yield None, None
-        return
-    # Ensure the book file is in a safe temp directory
-    book_file = params["book_file"]
-    book_title = params["book_title"]
-    if not os.path.exists(book_file):
-        # Try to recover by copying from original upload if possible (not always possible)
-        yield gr.Warning(
-            "Book file not found. Please re-upload and restart the task."
-        ), None
-        yield None, None
-        return
-    # Resume the task using stored parameters
-    import asyncio
+def save_llm_settings(base_url, api_key, model_name, no_think_mode):
+    """Save LLM settings"""
+    try:
+        config_manager.update_llm_config(
+            base_url=base_url,
+            api_key=api_key,
+            model_name=model_name,
+            no_think_mode=no_think_mode
+        )
+        return gr.Info("LLM settings saved successfully!", duration=5)
+    except Exception as e:
+        return gr.Warning(f"Error saving LLM settings: {str(e)}")
 
-    last_output = None
-    audiobook_path = None
-    async for output in process_audiobook_generation(
-        params["voice_type"],
-        params["narrator_gender"],
-        params["output_format"],
-        book_file,
-        book_title,
-        task_id,
-    ):
-        last_output = output
-        yield output, None
-    # After completion, set the output file path
-    generate_m4b_audiobook_file = (
-        True if params["output_format"] == "M4B (Chapters & Cover)" else False
-    )
-    file_extension = (
-        "m4b" if generate_m4b_audiobook_file else params["output_format"].lower()
-    )
-    safe_book_title = "".join(
-        c for c in params["book_title"] if c.isalnum() or c in (" ", "-", "_")
-    ).rstrip()
-    safe_book_title = safe_book_title or "audiobook"
-    audiobook_path = os.path.join(
-        "generated_audiobooks", f"{safe_book_title}.{file_extension}"
-    )
-    yield last_output, audiobook_path
-    return
+
+def test_tts_connection(base_url, api_key, model):
+    """Test TTS API connection"""
+    try:
+        import requests
+        # Test endpoint
+        test_url = f"{base_url.rstrip('/')}/audio/voices"
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key != "not-needed" else {}
+        
+        response = requests.get(test_url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            return gr.Info("✅ TTS connection successful!", duration=5)
+        else:
+            return gr.Warning(f"❌ TTS connection failed: HTTP {response.status_code}")
+    except Exception as e:
+        return gr.Warning(f"❌ TTS connection failed: {str(e)}")
+
+
+def test_llm_connection(base_url, api_key, model_name):
+    """Test LLM API connection"""
+    try:
+        from openai import OpenAI
+        
+        client = OpenAI(base_url=base_url, api_key=api_key)
+        # Try to get model list or make a simple completion
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": "Hello"}],
+            max_tokens=1
+        )
+        return gr.Info("✅ LLM connection successful!", duration=5)
+    except Exception as e:
+        return gr.Warning(f"❌ LLM connection failed: {str(e)}")
+
+
+
+
+
+
 
 
 with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
     gr.Markdown("# 📖 Audiobook Creator")
     gr.Markdown("Create professional audiobooks from your ebooks in just a few steps.")
+
+    # Settings Section
+    with gr.Accordion("⚙️ Settings (TTS & LLM Configuration)", open=False):
+        gr.Markdown("Configure your Text-to-Speech and Language Model settings. Changes are saved automatically.")
+        
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("### 🎤 Text-to-Speech (TTS) Settings")
+                
+                tts_base_url = gr.Textbox(
+                    label="TTS Base URL",
+                    placeholder="http://localhost:8880/v1",
+                    info="Base URL for your TTS API endpoint"
+                )
+                
+                tts_api_key = gr.Textbox(
+                    label="TTS API Key",
+                    placeholder="not-needed",
+                    type="password",
+                    info="API key for TTS service (use 'not-needed' if not required)"
+                )
+                
+                tts_model = gr.Radio(
+                    choices=["kokoro", "orpheus"],
+                    label="TTS Model",
+                    value="kokoro",
+                    info="Choose between Kokoro or Orpheus TTS models"
+                )
+                
+                tts_max_parallel = gr.Slider(
+                    minimum=1,
+                    maximum=10,
+                    step=1,
+                    value=2,
+                    label="Max Parallel Requests",
+                    info="Number of parallel TTS requests (adjust based on your hardware)"
+                )
+                
+                with gr.Row():
+                    save_tts_btn = gr.Button("💾 Save TTS Settings", variant="primary", size="sm")
+                    test_tts_btn = gr.Button("🔍 Test TTS Connection", variant="secondary", size="sm")
+            
+            with gr.Column():
+                gr.Markdown("### 🧠 Language Model (LLM) Settings")
+                
+                llm_base_url = gr.Textbox(
+                    label="LLM Base URL",
+                    placeholder="http://localhost:1234/v1",
+                    info="Base URL for your LLM API endpoint"
+                )
+                
+                llm_api_key = gr.Textbox(
+                    label="LLM API Key",
+                    placeholder="lm-studio",
+                    type="password",
+                    info="API key for LLM service"
+                )
+                
+                llm_model_name = gr.Textbox(
+                    label="LLM Model Name",
+                    placeholder="qwen3-14b",
+                    info="Name of the LLM model to use"
+                )
+                
+                llm_no_think_mode = gr.Checkbox(
+                    label="Disable Think Mode",
+                    value=True,
+                    info="Disable thinking mode for faster inference (for models like Qwen3, R1)"
+                )
+                
+                with gr.Row():
+                    save_llm_btn = gr.Button("💾 Save LLM Settings", variant="primary", size="sm")
+                    test_llm_btn = gr.Button("🔍 Test LLM Connection", variant="secondary", size="sm")
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -654,27 +856,24 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 )
 
                 output_format = gr.Dropdown(
-                    [
-                        "M4B (Chapters & Cover)",
-                        "AAC",
-                        "M4A",
-                        "MP3",
-                        "WAV",
-                        "OPUS",
-                        "FLAC",
-                        "PCM",
+                    choices=[
+                        ("M4B (Chapters & Cover)", "m4b"),
+                        ("AAC Audio", "aac"),
+                        ("M4A Audio", "m4a"),
+                        ("MP3 Audio", "mp3"),
+                        ("WAV Audio", "wav"),
+                        ("OPUS Audio", "opus"),
+                        ("FLAC Audio", "flac"),
+                        ("PCM Audio", "pcm"),
                     ],
                     label="Output Format",
-                    value="M4B (Chapters & Cover)",
+                    value="m4b",
                     info="M4B supports chapters and cover art",
                 )
 
             generate_btn = gr.Button("Generate Audiobook", variant="primary")
 
-            # Add Continue button for incomplete tasks
-            continue_btn = gr.Button(
-                "Continue Selected Task", variant="primary", visible=False
-            )
+
 
             audio_output = gr.Textbox(
                 label="Generation Progress",
@@ -704,6 +903,13 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 clear_tasks_btn = gr.Button(
                     "🧹 Clear All Temp Files", variant="secondary", size="sm"
                 )
+                
+            # Display temp directory information
+            temp_files_info = gr.Markdown(
+                value="Click refresh to see temp files information.",
+                visible=True,
+                elem_id="temp-files-info"
+            )
 
             # Task cancellation section
             with gr.Group(visible=False) as cancel_task_group:
@@ -734,14 +940,21 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     visible=False,
                 )
 
-            delete_btn = gr.Button(
-                "🗑️ Delete Selected",
-                variant="stop",
-                size="sm",
-                visible=False,
-            )
+            with gr.Row():
+                delete_btn = gr.Button(
+                    "🗑️ Delete Selected",
+                    variant="stop",
+                    size="sm",
+                    visible=False,
+                )
+                delete_all_btn = gr.Button(
+                    "🗑️💥 Delete All Audiobooks",
+                    variant="stop",
+                    size="sm",
+                    visible=True,
+                )
 
-            # Confirmation dialog for deletion (hidden by default)
+            # Confirmation dialog for single file deletion (hidden by default)
             with gr.Group(visible=False) as delete_confirmation:
                 gr.Markdown("### ⚠️ Confirm Deletion")
                 delete_info_display = gr.Markdown("")
@@ -751,6 +964,19 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                         "🗑️ Yes, Delete", variant="stop", size="sm"
                     )
                     cancel_delete_btn = gr.Button(
+                        "❌ Cancel", variant="secondary", size="sm"
+                    )
+
+            # Confirmation dialog for delete all operation (hidden by default)
+            with gr.Group(visible=False) as delete_all_confirmation:
+                gr.Markdown("### ⚠️ Confirm Delete All")
+                delete_all_info_display = gr.Markdown("")
+
+                with gr.Row():
+                    confirm_delete_all_btn = gr.Button(
+                        "🗑️💥 Yes, Delete All", variant="stop", size="sm"
+                    )
+                    cancel_delete_all_btn = gr.Button(
                         "❌ Cancel", variant="secondary", size="sm"
                     )
 
@@ -791,28 +1017,19 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         inputs=[audiobook_file],
         outputs=[download_box],
     ).then(
-        # Refresh past files list after successful generation
-        lambda x: (
-            refresh_past_files_with_continue()
-            if x is not None
-            else (
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-            )
-        ),
-        inputs=[audiobook_file],
+        # Always refresh past files list after generation (successful or failed)
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
         ],
+    ).then(
+        # Also refresh temp files info
+        get_temp_directory_info,
+        outputs=[temp_files_info],
     )
 
     # Refresh past files when the refresh button is clicked
@@ -824,26 +1041,15 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
+            
         ],
+    ).then(
+        get_temp_directory_info,
+        outputs=[temp_files_info],
     )
 
-    # Clear Temp Files when the clear tasks button is clicked
-    clear_tasks_btn.click(
-        clear_old_tasks_wrapper,
-        outputs=[],
-    ).then(
-        # Refresh the display after clearing tasks to update the active tasks section
-        refresh_past_files_with_continue,
-        outputs=[
-            past_files_display,
-            past_files_dropdown,
-            delete_btn,
-            active_tasks_dropdown,
-            cancel_task_group,
-            continue_btn,
-        ],
-    )
+   
+
 
     # Cancel task when the cancel button is clicked
     cancel_task_btn.click(
@@ -859,7 +1065,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
+            
         ],
     )
 
@@ -893,7 +1099,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
+            
         ],
     ).then(
         # Clear the download file after deletion
@@ -906,6 +1112,40 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         lambda: gr.update(visible=False), outputs=[delete_confirmation]
     )
 
+    # Show confirmation dialog when delete all button is clicked
+    delete_all_btn.click(
+        get_all_audiobooks_info,
+        outputs=[delete_all_info_display],
+    ).then(lambda: gr.update(visible=True), outputs=[delete_all_confirmation])
+
+    # Actually delete all files when confirmed
+    confirm_delete_all_btn.click(
+        delete_all_audiobooks, outputs=[]
+    ).then(
+        # Hide confirmation dialog
+        lambda: gr.update(visible=False),
+        outputs=[delete_all_confirmation],
+    ).then(
+        # Refresh the list after deletion
+        refresh_past_files_with_continue,
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
+    ).then(
+        # Clear the download file after deletion
+        lambda: gr.update(value=None, visible=False),
+        outputs=[past_file_download],
+    )
+
+    # Cancel delete all
+    cancel_delete_all_btn.click(
+        lambda: gr.update(visible=False), outputs=[delete_all_confirmation]
+    )
+
     # Load past files when the app starts
     gradio_app.load(
         refresh_past_files_with_continue,
@@ -915,44 +1155,30 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
+            
         ],
+    ).then(
+        get_temp_directory_info,
+        outputs=[temp_files_info],
     )
 
-    # Wire up continue_btn
-    continue_btn.click(
-        continue_audiobook_task,
-        inputs=[active_tasks_dropdown],
-        outputs=[audio_output, audiobook_file],
-        queue=True,
+    # Clear temp files when the clear button is clicked
+    clear_tasks_btn.click(
+        clear_temp_files,
+        outputs=[],
     ).then(
-        lambda x: (
-            gr.update(visible=True) if x is not None else gr.update(visible=False)
-        ),
-        inputs=[audiobook_file],
-        outputs=[download_box],
-    ).then(
-        lambda x: (
-            refresh_past_files_with_continue()
-            if x is not None
-            else (
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-                gr.update(),
-            )
-        ),
-        inputs=[audiobook_file],
+        # Refresh the display after clearing temp files
+        refresh_past_files_with_continue,
         outputs=[
             past_files_display,
             past_files_dropdown,
             delete_btn,
             active_tasks_dropdown,
             cancel_task_group,
-            continue_btn,
         ],
+    ).then(
+        get_temp_directory_info,
+        outputs=[temp_files_info],
     )
 
     # Wire up goto buttons for text scrolling
@@ -966,6 +1192,40 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         None,
         js="() => { const el = document.querySelector('#edit-book-content textarea'); if (el) el.scrollTop = el.scrollHeight; }",
         outputs=[],
+    )
+
+    # Settings event handlers
+    save_tts_btn.click(
+        save_tts_settings,
+        inputs=[tts_base_url, tts_api_key, tts_model, tts_max_parallel],
+        outputs=[]
+    )
+    
+    save_llm_btn.click(
+        save_llm_settings,
+        inputs=[llm_base_url, llm_api_key, llm_model_name, llm_no_think_mode],
+        outputs=[]
+    )
+    
+    test_tts_btn.click(
+        test_tts_connection,
+        inputs=[tts_base_url, tts_api_key, tts_model],
+        outputs=[]
+    )
+    
+    test_llm_btn.click(
+        test_llm_connection,
+        inputs=[llm_base_url, llm_api_key, llm_model_name],
+        outputs=[]
+    )
+
+    # Load current settings when the app starts
+    gradio_app.load(
+        load_current_settings,
+        outputs=[
+            tts_base_url, tts_api_key, tts_model, tts_max_parallel,
+            llm_base_url, llm_api_key, llm_model_name, llm_no_think_mode
+        ]
     )
 
 app = gr.mount_gradio_app(app, gradio_app, path="/")  # Mount Gradio at root
