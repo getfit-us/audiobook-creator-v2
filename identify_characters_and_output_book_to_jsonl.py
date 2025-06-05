@@ -75,18 +75,18 @@ def get_llm_config():
         'no_think_mode': llm_config.get("no_think_mode", True)
     }
 
+# Get dynamic LLM client function
+from config.constants import get_current_llm_client
+
 # Initialize configuration
 _llm_config = get_llm_config()
-OPENAI_BASE_URL = _llm_config['base_url']
-OPENAI_API_KEY = _llm_config['api_key']
-OPENAI_MODEL_NAME = _llm_config['model_name']
+LLM_MODEL_NAME = _llm_config['model_name']
 
 # warnings.simplefilter("ignore")
 
 print("\n🚀 **Downloading the GLiNER Model ...**")
 
-async_openai_client = AsyncOpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
-model_name = OPENAI_MODEL_NAME
+model_name = LLM_MODEL_NAME
 gliner_model = download_with_progress("urchade/gliner_large-v2.1")
 
 print("\n🚀 **GLiNER Model Backend Selection**")
@@ -289,7 +289,7 @@ async def identify_character_gender_and_age_using_llm_and_assign_score(
         """
 
         # Query the LLM to infer age and gender
-        response = await async_openai_client.chat.completions.create(
+        response = await get_current_llm_client().chat.completions.create(
             model=model_name,
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -502,14 +502,14 @@ async def identify_characters_and_output_book_to_jsonl(
 
 async def process_book_and_identify_characters(book_title):
     converted_book_path = f"{TEMP_DIR}/{book_title}/converted_book.txt"
-    is_llm_up, message = await check_if_llm_is_up(async_openai_client, model_name)
+    is_llm_up, message = await check_if_llm_is_up(get_current_llm_client(), model_name)
 
     if not is_llm_up:
         raise Exception(message)
 
     yield "Finding protagonist. Please wait..."
     protagonist = await find_book_protagonist(
-        book_title, async_openai_client, model_name
+        book_title, get_current_llm_client(), model_name
     )
     if not os.path.exists(converted_book_path):
         raise Exception(f"Converted book not found at {converted_book_path}")

@@ -27,12 +27,13 @@ from word2number import w2n
 import time
 import sys
 from config.constants import (
-    API_KEY,
+    TTS_API_KEY,
     API_OUTPUT_FORMAT,
-    BASE_URL,
-    MODEL,
+    TTS_BASE_URL,
+    TTS_MODEL,
     MAX_PARALLEL_REQUESTS_BATCH_SIZE,
     TEMP_DIR,
+    get_current_tts_client,
 )
 from utils.check_tts_api import check_tts_api
 from utils.run_shell_commands import (
@@ -63,7 +64,6 @@ load_dotenv()
 
 os.makedirs("audio_samples", exist_ok=True)
 
-async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 
 
 def sanitize_filename(text):
@@ -475,7 +475,7 @@ async def generate_audio_files(
         print(f"Processing multi-voice lines")
 
         try:
-            voice_config = select_voice(narrator_gender, MODEL, "multi_voice", book_title)
+            voice_config = select_voice(narrator_gender, TTS_MODEL, "multi_voice", book_title)
             speaker_file_path = voice_config["speaker_file_path"]
             narrator_voice = voice_config["narrator_voice"]
             
@@ -507,7 +507,7 @@ async def generate_audio_files(
     else:
         # handle single voice
         try:
-            voice_config = select_voice(narrator_gender, MODEL, "single_voice", book_title)
+            voice_config = select_voice(narrator_gender, TTS_MODEL, "single_voice", book_title)
             narrator_voice = voice_config["narrator_voice"]
             dialogue_voice = voice_config["dialogue_voice"]
             
@@ -622,7 +622,7 @@ async def generate_audio_files(
                         )
                         raise asyncio.CancelledError("Task was cancelled by user")
 
-                    if MODEL == "orpheus":
+                    if TTS_MODEL == "orpheus":
                         # add full stops where necessary
                         text_to_speak = preprocess_text_for_orpheus(text_to_speak)
 
@@ -647,7 +647,7 @@ async def generate_audio_files(
                     try:
 
                         current_part_audio_buffer = await generate_tts_with_retry(
-                            MODEL,
+                            TTS_MODEL,
                             voice,  
                             text_to_speak,
                             API_OUTPUT_FORMAT,
@@ -891,11 +891,11 @@ async def process_audiobook_generation(
     book_title="audiobook",
     task_id=None,
 ):
-    # Select narrator voice string based on narrator_gender and MODEL
-    narrator_voice = select_tts_voice(MODEL, narrator_gender)
+    # Select narrator voice string based on narrator_gender and TTS_MODEL
+    narrator_voice = select_tts_voice(TTS_MODEL, narrator_gender)
 
     is_tts_api_up, message = await check_tts_api(
-        async_openai_client, MODEL, narrator_voice
+        get_current_tts_client(), TTS_MODEL, narrator_voice
     )
 
     if not is_tts_api_up:

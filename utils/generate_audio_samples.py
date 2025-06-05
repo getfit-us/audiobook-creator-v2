@@ -25,20 +25,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-BASE_URL = os.environ.get("BASE_URL", "http://localhost:8880/v1")
-API_KEY = os.environ.get("API_KEY", "not-needed")
-MODEL = os.environ.get("MODEL", "kokoro")
-FORMAT = "wav" if MODEL == "orpheus" else "aac"
+TTS_BASE_URL = os.environ.get("TTS_BASE_URL", "http://localhost:8880/v1")
+TTS_API_KEY = os.environ.get("TTS_API_KEY", "not-needed")
+TTS_MODEL = os.environ.get("TTS_MODEL", "kokoro")
+FORMAT = "wav" if TTS_MODEL == "orpheus" else "aac"
 os.makedirs("audio_samples", exist_ok=True)
 
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
+client = OpenAI(base_url=TTS_BASE_URL, api_key=TTS_API_KEY)
 
 text = """Humpty Dumpty sat on a wall.
 Humpty Dumpty had a great fall.
 All the king's horses and all the king's men
 Couldn't put Humpty together again."""
 
-response = requests.get(f"{BASE_URL}/audio/voices")
+response = requests.get(f"{TTS_BASE_URL}/audio/voices")
 voices_res = response.json()
 voices = voices_res["voices"]
 # print("Available voices:", voices)
@@ -62,7 +62,7 @@ if gen_for_all_combinations == "yes":
     ) as overall_pbar:
         for voice in all_voices_combinations:
             with client.audio.speech.with_streaming_response.create(
-                model=MODEL,
+                model=TTS_MODEL,
                 voice=voice,
                 response_format=FORMAT,  # Ensuring format consistency
                 speed=0.85,
@@ -77,7 +77,7 @@ else:
     ) as overall_pbar:
         for voice in voices:
             with client.audio.speech.with_streaming_response.create(
-                model=MODEL,
+                model=TTS_MODEL,
                 voice=voice,
                 response_format=FORMAT,  # Ensuring format consistency
                 speed=0.85,

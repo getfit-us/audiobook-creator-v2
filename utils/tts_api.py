@@ -3,11 +3,8 @@ import random
 
 from openai import AsyncOpenAI
 
-from config.constants import API_KEY, BASE_URL
+from config.constants import get_current_tts_client
 from utils.task_utils import is_task_cancelled
-
-
-async_openai_client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
 
 async def generate_tts_with_retry(
     model, voice, text, response_format, speed=0.85, max_retries=5, task_id=None
@@ -59,7 +56,7 @@ async def generate_tts_with_retry(
 
             audio_buffer = bytearray()
 
-            async with async_openai_client.audio.speech.with_streaming_response.create(
+            async with get_current_tts_client().audio.speech.with_streaming_response.create(
                 model=model,
                 voice=voice,
                 response_format=response_format,

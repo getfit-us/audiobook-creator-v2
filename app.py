@@ -705,7 +705,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 
                 tts_max_parallel = gr.Slider(
                     minimum=1,
-                    maximum=10,
+                    maximum=30,
                     step=1,
                     value=2,
                     label="Max Parallel Requests",
@@ -871,9 +871,10 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                     info="M4B supports chapters and cover art",
                 )
 
-            generate_btn = gr.Button("Generate Audiobook", variant="primary")
-
-
+            with gr.Row():
+                generate_btn = gr.Button("Generate Audiobook", variant="primary")
+                # Add a quick cancel button right next to generate (initially hidden)
+                quick_cancel_btn = gr.Button("⏹️ Stop Generation", variant="stop", visible=False)
 
             audio_output = gr.Textbox(
                 label="Generation Progress",
@@ -917,7 +918,7 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
                 active_tasks_dropdown = gr.Dropdown(
                     label="Select task to stop",
                     choices=[],
-                    visible=False,
+                    visible=True,
                     interactive=True,
                 )
                 cancel_task_btn = gr.Button("⏹️ Stop Task", variant="stop", size="sm")
@@ -1030,6 +1031,52 @@ with gr.Blocks(css=css, theme=gr.themes.Default()) as gradio_app:
         # Also refresh temp files info
         get_temp_directory_info,
         outputs=[temp_files_info],
+    ).then(
+        # Hide quick cancel button after generation
+        lambda: gr.update(visible=False),
+        outputs=[quick_cancel_btn],
+    )
+
+    # Show quick cancel button when generation starts
+    generate_btn.click(
+        lambda: gr.update(visible=True),
+        outputs=[quick_cancel_btn],
+        queue=False,
+    )
+
+    # Handle quick cancel button
+    def quick_cancel_current_task():
+        """Cancel the most recent active task"""
+        active_tasks = get_active_tasks()
+        if active_tasks:
+            # Cancel the most recent task (last in the list)
+            latest_task = active_tasks[-1]
+            task_id = latest_task['id']
+            success, message = cancel_task(task_id)
+            if success:
+                return gr.Info(f"Generation stopped: {message}", duration=5)
+            else:
+                return gr.Warning(f"Failed to stop generation: {message}")
+        else:
+            return gr.Warning("No active generation to stop.")
+
+    quick_cancel_btn.click(
+        quick_cancel_current_task,
+        outputs=[],
+    ).then(
+        # Hide the quick cancel button after cancelling
+        lambda: gr.update(visible=False),
+        outputs=[quick_cancel_btn],
+    ).then(
+        # Refresh the display after cancelling
+        refresh_past_files_with_continue,
+        outputs=[
+            past_files_display,
+            past_files_dropdown,
+            delete_btn,
+            active_tasks_dropdown,
+            cancel_task_group,
+        ],
     )
 
     # Refresh past files when the refresh button is clicked

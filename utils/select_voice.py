@@ -1,7 +1,7 @@
 import os
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
-from config.constants import TEMP_DIR, MODEL
+from config.constants import TEMP_DIR, TTS_MODEL
 
 
 @dataclass

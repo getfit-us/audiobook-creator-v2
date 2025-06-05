@@ -125,7 +125,7 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
   This will start the Orpheus TTS service on port 5005. Make sure to update your `.env` file accordingly:
 
   ```
-  BASE_URL=http://localhost:5005/v1
+  TTS_BASE_URL=http://localhost:5005/v1
   ```
 
 - Create a .env file from .env_sample and configure it with the correct values. Make sure you follow the instructions mentioned at the top of .env_sample to avoid errors.

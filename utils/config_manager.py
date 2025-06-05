@@ -21,16 +21,16 @@ class ConfigManager:
         return {
             # TTS Settings
             "tts": {
-                "base_url": os.environ.get("BASE_URL", "http://localhost:8880/v1"),
-                "api_key": os.environ.get("API_KEY", "not-needed"),
-                "model": os.environ.get("MODEL", "kokoro"),
+                "base_url": os.environ.get("TTS_BASE_URL", "http://localhost:8880/v1"),
+                "api_key": os.environ.get("TTS_API_KEY", "not-needed"),
+                "model": os.environ.get("TTS_MODEL", "kokoro"),
                 "max_parallel_requests": int(os.environ.get("MAX_PARALLEL_REQUESTS_BATCH_SIZE", "2"))
             },
             # LLM Settings  
             "llm": {
-                "base_url": os.environ.get("OPENAI_BASE_URL", "http://localhost:1234/v1"),
-                "api_key": os.environ.get("OPENAI_API_KEY", "lm-studio"),
-                "model_name": os.environ.get("OPENAI_MODEL_NAME", "qwen3-14b"),
+                "base_url": os.environ.get("LLM_BASE_URL", "http://localhost:1234/v1"),
+                "api_key": os.environ.get("LLM_API_KEY", "lm-studio"),
+                "model_name": os.environ.get("LLM_MODEL_NAME", "qwen3-14b"),
                 "no_think_mode": os.environ.get("NO_THINK_MODE", "true").lower() == "true"
             },
             # App Settings
