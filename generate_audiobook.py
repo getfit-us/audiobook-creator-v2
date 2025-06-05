@@ -829,14 +829,27 @@ async def generate_audio_files(
             missing_files.append(line_idx)
 
     if missing_files:
-        print(
-            f"ERROR: {len(missing_files)} audio files are missing or empty: {missing_files[:10]}..."
-        )
-        raise Exception(
-            f"Cannot proceed with concatenation - {len(missing_files)} audio files are missing"
-        )
+        print(f"⚠️ Found {len(missing_files)} missing audio files: {missing_files[:10]}...")
+        yield f"Regenerating {len(missing_files)} missing audio files..."
+        
+        # Simply call process_single_line for each missing file
+        for missing_idx in missing_files:
+            if missing_idx < len(lines_to_process):
+                try:
+                    result = await process_single_line(missing_idx, lines_to_process[missing_idx], type)
+                    if result:
+                        results_all[missing_idx] = result
+                        print(f"✅ Successfully regenerated audio for line {missing_idx}")
+                    else:
+                        print(f"⚠️ Failed to regenerate audio for line {missing_idx} - likely empty line")
+                except Exception as e:
+                    print(f"❌ Failed to regenerate audio for line {missing_idx}: {e}")
+        
+        yield "Regeneration complete"
 
-    print(f"✅ All {len(results)} audio files validated successfully")
+    # Update results to include regenerated files  
+    results = [r for r in results_all if r is not None]
+    print(f"✅ Validation complete: {len(results)} audio files ready for concatenation")
 
     # Second pass: Organize by chapters
     chapter_organization_bar = tqdm(
@@ -1498,14 +1511,29 @@ async def generate_audiobook_background(
             missing_files.append(line_idx)
 
     if missing_files:
-        print(
-            f"ERROR: {len(missing_files)} audio files are missing or empty: {missing_files[:10]}..."
-        )
-        raise Exception(
-            f"Cannot proceed with concatenation - {len(missing_files)} audio files are missing"
-        )
+        print(f"⚠️ Found {len(missing_files)} missing audio files: {missing_files[:10]}...")
+        if task_id:
+            update_task_status(task_id, "running", f"Regenerating {len(missing_files)} missing audio files...")
+        
+        # Simply call process_single_line for each missing file
+        for missing_idx in missing_files:
+            if missing_idx < len(lines_to_process):
+                try:
+                    result = await process_single_line(missing_idx, lines_to_process[missing_idx], type)
+                    if result:
+                        results_all[missing_idx] = result
+                        print(f"✅ Successfully regenerated audio for line {missing_idx}")
+                    else:
+                        print(f"⚠️ Failed to regenerate audio for line {missing_idx}")
+                except Exception as e:
+                    print(f"❌ Failed to regenerate audio for line {missing_idx}: {e}")
+        
+        if task_id:
+            update_task_status(task_id, "running", "Regeneration complete")
 
-    print(f"✅ All {len(results)} audio files validated successfully")
+    # Update results to include regenerated files  
+    results = [r for r in results_all if r is not None]
+    print(f"✅ Validation complete: {len(results)} audio files ready for concatenation")
 
     # Second pass: Organize by chapters
     chapter_organization_bar = tqdm(
