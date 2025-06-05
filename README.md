@@ -3,7 +3,7 @@
 ## Overview
 
 Original Author: https://github.com/prakharsr/audiobook-creator
- **Prakhar Sharma**
+**Prakhar Sharma**
 
 Additions and Changes:
 **Chris Scott**
@@ -87,26 +87,14 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
   For CUDA based GPU inference (Apple Silicon GPUs currently not supported, use CPU based inference instead). Choose the value of MAX_PARALLEL_REQUESTS_BATCH_SIZE based on [this guide](https://github.com/prakharsr/audiobook-creator/?tab=readme-ov-file#parallel-batch-inferencing-of-audio-for-faster-audio-generation)
 
   ```bash
-  docker run \
-   --name service \
-   --restart always \
-   --network host \
-   --gpus all \
-   ghcr.io/remsky/kokoro-fastapi-gpu:v0.2.2    
-   uvicorn api.src.main:app --host 0.0.0.0 --port 8880 --log-level debug \
-   --workers {MAX_PARALLEL_REQUESTS_BATCH_SIZE}
+ 
+docker run --gpus all -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-gpu:latest  
   ```
 
   For CPU based inference. In this case you can keep number of workers as 1 as only mostly GPU based inferencing benefits from parallel workers and batch requests.
 
   ```bash
-  docker run \
-   --name service \
-   --restart always \
-   --network host \
-   ghcr.io/remsky/kokoro-fastapi-cpu:v0.2.2 \
-   uvicorn api.src.main:app --host 0.0.0.0 --port 8880 --log-level debug \
-   --workers 1
+ docker run -p 8880:8880 ghcr.io/remsky/kokoro-fastapi-cpu:latest 
   ```
 
   **Option B: Orpheus TTS** via [Orpheus-FastAPI](https://github.com/Lex-au/Orpheus-FastAPI). Orpheus offers high-performance TTS with emotion tags and 8 different voices. To get started:
