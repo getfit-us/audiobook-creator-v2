@@ -47,13 +47,14 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
 
 - **Gradio UI App**: Create audiobooks easily with an easy to use, intuitive UI made with Gradio.
 - **UI-based Configuration**: Configure TTS and LLM settings directly from the web interface - no need to edit .env files after initial setup. Settings are automatically saved and persistent across restarts.
+- **Primary Character Voice Mapping**: Multi-voice narration is automatically limited to primary characters identified through NER and clustering. Minor characters are consolidated into the narrator voice to reduce LLM usage.
 - **M4B Audiobook Creation**: Creates compatible audiobooks with covers, metadata, chapter timestamps etc. in M4B format.
 - **Multi-Format Input Support**: Converts books from various formats (EPUB, PDF, etc.) into plain text.
 - **Multi-Format Output Support**: Supports various output formats: AAC, M4A, MP3, WAV, OPUS, FLAC, PCM, M4B.
 - **Docker Support**: Use pre-built docker images/ build using docker compose to save time and for a smooth user experience.
 - **Text Cleaning**: Ensures the book text is well-formatted and readable.
 - **Character Identification**: Identifies characters and infers their attributes (gender, age) using advanced NLP techniques.
-- **Customizable Audiobook Narration**: Supports single-voice or multi-voice narration for enhanced listening experiences.
+- **Customizable Audiobook Narration**: Supports single-voice or multi-voice narration. In multi-voice mode, only primary characters (up to 8 total) receive distinct voices based on their gender/age scores. All other characters use the narrator voice automatically.
 - **Progress Tracking**: Includes progress bars and execution time measurements for efficient monitoring.
 - **Open Source**: Licensed under GPL v3.
 
@@ -65,6 +66,7 @@ Sample multi voice audio for a short story : https://audio.com/prakhar-sharma/au
 - `sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.epub`: A sample short story in epub format as a starting point.
 - `sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.pdf`: A sample short story in pdf format as a starting point.
 - `sample_book_and_audio/The Adventure of the Lost Treasure - Prakhar Sharma.txt`: A sample short story in txt format as a starting point.
+- `sample_book_and_audio/character_gender_map.json`: Demonstrates how character metadata is automatically filtered to include only primary characters.
 - `sample_book_and_audio/converted_book.txt`: The cleaned output after text processing.
 - `sample_book_and_audio/speaker_attributed_book.jsonl`: The generated speaker-attributed JSONL file.
 - `sample_book_and_audio/character_gender_map.json`: The generated character metadata.
