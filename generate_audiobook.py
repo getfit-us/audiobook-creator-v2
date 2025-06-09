@@ -87,6 +87,33 @@ def sanitize_book_title_for_filename(book_title):
     return safe_title or "audiobook"  # fallback if title becomes empty
 
 
+def validate_speaker_name(speaker_name):
+    """
+    Validate and clean a speaker name for voice selection.
+    
+    Returns:
+        tuple: (is_valid, cleaned_name)
+        - is_valid: bool indicating if the name is valid for voice selection
+        - cleaned_name: cleaned version of the name, or None if invalid
+    """
+    if not speaker_name:
+        return False, None
+        
+    cleaned = speaker_name.strip().lower()
+    
+    # Invalid speaker names that should use narrator voice
+    invalid_names = {"", "unknown", "narrator", "speaker", "voice", "someone", "person"}
+    
+    if cleaned in invalid_names:
+        return False, None
+        
+    # Check for very short names (likely artifacts)
+    if len(cleaned) < 2:
+        return False, None
+        
+    return True, cleaned
+
+
 def split_and_annotate_text(text):
     """Splits text into dialogue and narration while annotating each segment."""
     parts = re.split(r'("[^"]+")', text)  # Keep dialogues in the split result
@@ -321,23 +348,38 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
             print(
                 f"WARNING: Character '{character}' not found in character_gender_map. Using narrator voice as fallback."
             )
-            # Use narrator's voice as fallback
-            if "narrator" in character_gender_map["scores"]:
-                character_gender_score_doc = character_gender_map["scores"]["narrator"]
-                character_gender_score = character_gender_score_doc["gender_score"]
+            # Use narrator's voice as fallback - return first available voice
+            if voice_map:
+                fallback_voice = list(voice_map.keys())[0]
+                print(f"Using first available voice '{fallback_voice}' for unknown character '{character}'")
+                return fallback_voice
             else:
-                print(
-                    f"ERROR: Even narrator not found in character_gender_map. Using score 5 (neutral)."
-                )
-                character_gender_score = 5
+                print(f"ERROR: voice_map is empty. Using hardcoded fallback voice.")
+                return "af_heart"  # Default fallback voice
         else:
             character_gender_score_doc = character_gender_map["scores"][character_lower]
             character_gender_score = character_gender_score_doc["gender_score"]
+            
+            # Special handling for narrator (score -1)
+            if character_gender_score == -1:
+                print(f"Character '{character}' is narrator with special score -1, should use narrator voice directly")
+                # This shouldn't happen in normal flow, but if it does, return first voice
+                if voice_map:
+                    fallback_voice = list(voice_map.keys())[0]
+                    return fallback_voice
+                else:
+                    return "af_heart"
 
-        # Iterate over the voice identifiers and their scores
+        # Ensure gender score is in valid range (1-10)
+        if character_gender_score < 1 or character_gender_score > 10:
+            print(f"WARNING: Invalid gender score {character_gender_score} for character '{character}'. Using score 5 (neutral).")
+            character_gender_score = 5
+
+        # Iterate over the voice identifiers and their scores for exact match
         for voice, score in voice_map.items():
             # Find the voice identifier that matches the character's gender score
             if score == character_gender_score:
+                print(f"Found exact voice match for character '{character}' (score {character_gender_score}): {voice}")
                 return voice
 
         # If no exact match found, find the closest gender score
@@ -347,16 +389,25 @@ def find_voice_for_gender_score(character: str, character_gender_map, voice_map)
 
         closest_voice = None
         closest_diff = float("inf")
+        
+        # Validate voice_map is not empty
+        if not voice_map:
+            print(f"ERROR: voice_map is empty for character '{character}'")
+            return "af_heart"  # Default fallback
 
         for voice, score in voice_map.items():
-            diff = abs(score - character_gender_score)
-            if diff < closest_diff:
-                closest_diff = diff
-                closest_voice = voice
+            try:
+                diff = abs(int(score) - character_gender_score)
+                if diff < closest_diff:
+                    closest_diff = diff
+                    closest_voice = voice
+            except (ValueError, TypeError) as e:
+                print(f"WARNING: Invalid score '{score}' for voice '{voice}': {e}")
+                continue
 
         if closest_voice:
             print(
-                f"Using voice '{closest_voice}' (score {voice_map[closest_voice]}) for character '{character}' (score {character_gender_score})"
+                f"Using closest voice '{closest_voice}' (score {voice_map[closest_voice]}) for character '{character}' (score {character_gender_score})"
             )
             return closest_voice
 
@@ -637,15 +688,34 @@ async def generate_audio_files(
 
                     voice = ""
                     if type.lower() == "multi_voice":
-                        # For multi-voice mode, use speaker-based voice selection
-                        if speaker_name and speaker_name.lower() == "narrator":
+                        # For multi-voice mode, consider both speaker and content type
+                        if part["type"] == "narration":
+                            # Narration always uses narrator voice, regardless of speaker
                             voice = narrator_voice
-                        elif speaker_name and character_gender_map and voice_map:
-                            voice = find_voice_for_gender_score(speaker_name, character_gender_map, voice_map)
+                            print(f"[DEBUG] Using narrator voice for narration (speaker: {speaker_name})")
+                        elif part["type"] == "dialogue":
+                            # Dialogue uses character-specific voice
+                            is_valid_speaker, cleaned_speaker = validate_speaker_name(speaker_name)
+                            
+                            if not is_valid_speaker or cleaned_speaker == "narrator":
+                                voice = narrator_voice
+                                print(f"[DEBUG] Using narrator voice for dialogue (invalid/narrator speaker: {speaker_name})")
+                            elif character_gender_map and voice_map:
+                                try:
+                                    voice = find_voice_for_gender_score(cleaned_speaker, character_gender_map, voice_map)
+                                    print(f"[DEBUG] Using character voice for {cleaned_speaker}: {voice}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Error finding voice for {cleaned_speaker}: {e}")
+                                    voice = narrator_voice
+                                    print(f"[DEBUG] Falling back to narrator voice due to error")
+                            else:
+                                # Fallback to narrator voice if maps not available
+                                voice = narrator_voice
+                                print(f"[DEBUG] Using narrator voice fallback - missing character maps (speaker: {speaker_name})")
                         else:
-                            # Fallback to narrator voice if speaker not found
+                            # Unknown content type, fallback to narrator
                             voice = narrator_voice
-                            print(f"[DEBUG] Using narrator voice fallback for speaker: {speaker_name}")
+                            print(f"[DEBUG] Using narrator voice for unknown content type: {part['type']}")
                     else:
                         # For single-voice mode, use narration/dialogue logic
                         if part["type"] == "narration":
@@ -1319,15 +1389,34 @@ async def generate_audiobook_background(
 
                     voice = ""
                     if type.lower() == "multi_voice":
-                        # For multi-voice mode, use speaker-based voice selection
-                        if speaker_name and speaker_name.lower() == "narrator":
+                        # For multi-voice mode, consider both speaker and content type
+                        if part["type"] == "narration":
+                            # Narration always uses narrator voice, regardless of speaker
                             voice = narrator_voice
-                        elif speaker_name and character_gender_map and voice_map:
-                            voice = find_voice_for_gender_score(speaker_name, character_gender_map, voice_map)
+                            print(f"[DEBUG] Using narrator voice for narration (speaker: {speaker_name})")
+                        elif part["type"] == "dialogue":
+                            # Dialogue uses character-specific voice
+                            is_valid_speaker, cleaned_speaker = validate_speaker_name(speaker_name)
+                            
+                            if not is_valid_speaker or cleaned_speaker == "narrator":
+                                voice = narrator_voice
+                                print(f"[DEBUG] Using narrator voice for dialogue (invalid/narrator speaker: {speaker_name})")
+                            elif character_gender_map and voice_map:
+                                try:
+                                    voice = find_voice_for_gender_score(cleaned_speaker, character_gender_map, voice_map)
+                                    print(f"[DEBUG] Using character voice for {cleaned_speaker}: {voice}")
+                                except Exception as e:
+                                    print(f"[DEBUG] Error finding voice for {cleaned_speaker}: {e}")
+                                    voice = narrator_voice
+                                    print(f"[DEBUG] Falling back to narrator voice due to error")
+                            else:
+                                # Fallback to narrator voice if maps not available
+                                voice = narrator_voice
+                                print(f"[DEBUG] Using narrator voice fallback - missing character maps (speaker: {speaker_name})")
                         else:
-                            # Fallback to narrator voice if speaker not found
+                            # Unknown content type, fallback to narrator
                             voice = narrator_voice
-                            print(f"[DEBUG] Using narrator voice fallback for speaker: {speaker_name}")
+                            print(f"[DEBUG] Using narrator voice for unknown content type: {part['type']}")
                     else:
                         # For single-voice mode, use narration/dialogue logic
                         if part["type"] == "narration":
